@@ -1,0 +1,28 @@
+default: check
+
+install:
+    pip install -e '.[dev]'
+
+check: lint typecheck test
+
+lint:
+    ruff check .
+    ruff format --check .
+
+fmt:
+    ruff format .
+
+typecheck:
+    mypy
+
+test:
+    pytest
+
+docker:
+    docker build -t dsql-replicator:dev .
+
+migrate target_cluster target_region:
+    SOURCE_STREAMS=dsql-cdc-stream \
+    TARGET_CLUSTER_ID={{target_cluster}} \
+    TARGET_REGION={{target_region}} \
+    dsql-replicator migrate

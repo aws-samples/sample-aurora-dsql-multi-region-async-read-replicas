@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+coverage.xml
+htmlcov/
+
+# CDK
+cdk.out/
+cdk.context.json
+.cdk.staging/
+
+# Node (CDK bootstrap might create these if invoked locally)
+node_modules/
+
+# OS / editors
+.DS_Store
+*.swp
+.vscode/
+.idea/
+
+# Local artifacts
+build/
+dist/
+*.log

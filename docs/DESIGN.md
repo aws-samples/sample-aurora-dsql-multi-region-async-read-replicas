@@ -1,0 +1,357 @@
+# Design — Aurora DSQL Multi-Region Async Replicator
+
+A prose-only companion to `OVERVIEW.md` (what it does) and `ARCHITECTURE.md`
+(how the pieces fit). This document answers **why** — the design decisions
+behind the implementation, the alternatives they rule out, and the trade-offs
+they accept.
+
+---
+
+## 1. The problem
+
+Aurora DSQL is a single-region managed database. Customers who need a
+cross-region read copy, a DR standby, or a bridge during migrations have to
+build the replication themselves. Doing it naively from the DSQL CDC stream
+is a trap for three reasons:
+
+- The Kinesis stream that carries CDC is **unordered across shards**. The
+  rows of a single committed source transaction can land on different shards
+  in different orders. Any "apply as you read" design produces partial
+  transactions on the target as the normal case, not an edge case.
+- CDC is **net-effect**, not an operation log. Ten updates to one row
+  collapse into one record with the final value; deletes carry only the
+  primary key. Statement replay would diverge from source.
+- Every cross-region DSQL commit costs **~300–500 ms**. Any design that
+  serializes the commit lane for the whole stream caps at a handful of
+  transactions per second — unusable beyond a demo.
+
+This project is a reference implementation that handles atomicity,
+exactly-once effect, per-row order, operator recovery, and useful throughput
+so customers do not have to re-derive these trade-offs.
+
+---
+
+## 2. What this system does — and does not do
+
+**Does:**
+
+- Mirrors committed row changes from one Aurora DSQL cluster to another
+  DSQL cluster in a different region (or stage), asynchronously, with
+  seconds of lag under normal load.
+- Reassembles each source transaction completely before anything downstream
+  sees it. Target readers never observe partial transactions.
+- Guarantees exactly-once effect under replay. Duplicate deliveries,
+  consumer restarts, and operator retries produce the same target state.
+- Preserves per-row commit order. Two transactions touching the same row
+  commit in source order; two transactions on disjoint rows may commit
+  concurrently.
+- Routes permanently-failing transactions to a durable fence stored in the
+  target cluster. Forward progress halts cleanly until an operator inspects,
+  retries, or explicitly skips.
+- Fails over cleanly between consumer processes via a shard lease with a
+  fencing token and a heartbeat.
+- Publishes throughput, lag, buffer depth, fence state, and per-shard Kinesis
+  lag to CloudWatch with a dashboard and five alarms.
+- Deploys as a single container on AWS Fargate with one command, encrypted at
+  rest, under a least-privilege IAM role.
+
+**Does NOT:**
+
+- Replicate DDL — the operator applies schema changes to both clusters out of
+  band.
+- Preserve cross-row application-level atomicity across the replica (a
+  two-account money transfer is not atomic from the replica's view). This
+  matches standard CDC behavior.
+- Resolve conflicts against writes made on the target cluster.
+- Filter or transform rows.
+- Provide an HTTPS admin surface — all operator actions are CLI-driven.
+- Run more than one active consumer process at a time. The lease model is
+  for failover, not throughput.
+- Fan one source out to multiple target clusters from one process.
+
+---
+
+## 3. The design choices
+
+Each entry: what we decided, why we decided it, what we traded away.
+
+### 3.1 Reassemble every transaction before any downstream stage sees it
+
+The CDC envelope carries a transaction id and a total-records count on every
+record of a transaction. The pipeline buffers records keyed by transaction id
+and releases only when the count matches.
+
+- **Why.** Without this, Kinesis's cross-shard unorderedness makes
+  partial-transaction apply the normal case. This invariant is the
+  load-bearing primitive that makes atomic cross-row apply downstream
+  possible.
+- **Trade-off.** Memory held per in-flight transaction, plus a timeout path
+  for transactions whose records never fully arrive. The timeout surface is
+  explicitly tested; we do not rely on it in production.
+
+### 3.2 Per-shard ordering with a bounded priority buffer
+
+Completed transactions sit in a priority queue keyed by their source
+timestamp. The queue releases a transaction only when every shard's
+watermark has advanced past it, using a strict less-than rule. The buffer has
+a hard cap; when full it back-pressures the Kinesis reader.
+
+- **Why.** Out-of-order release across shards would commit a newer timestamp
+  before an older one and break the per-key ordering guarantee downstream.
+  The strict less-than rule prevents equality collisions where two shards
+  happen to carry the same timestamp. The hard cap prevents unbounded memory
+  as a failure mode when the applier is slower than the consumer.
+- **Trade-off.** One extra ingest tick of latency at the gate. Under
+  sustained back-pressure, Kinesis's 24-hour retention becomes the overflow
+  buffer.
+
+### 3.3 Per-key stripe-locked parallel apply (not serial, not per-row)
+
+The applier owns N stripes. Each transaction hashes its primary keys into a
+sorted set of stripes, acquires those stripes' locks in sorted order, then
+runs one atomic target-side transaction holding only those stripes.
+Transactions on disjoint keys commit concurrently; transactions sharing any
+key serialize on that key.
+
+- **Why.** An earlier design serialized the entire commit lane for a global
+  timestamp order and capped at a handful of transactions per second —
+  unusable for any realistic workload (OLTP commonly runs 50–500 TPS).
+  Per-row order is the contract SQL already gives per row; cross-key order
+  was conservative, not required. Industry CDC pipelines (DMS, Debezium
+  Sink, Striim, Fivetran) all do this for the same reason.
+- **Trade-off.** Cross-row application-level atomicity across the replica is
+  lost. The system now matches the standard CDC contract rather than
+  offering a stronger one.
+
+### 3.4 Idempotent apply via per-transaction stamps in the target database
+
+The target cluster holds a stamp table keyed by (transaction id, record id).
+Each row apply and its stamp commit in the same target transaction. Replays
+see the stamp and short-circuit.
+
+- **Why.** Any other scheme creates a window where "crashed between apply
+  and remembering we applied" produces a duplicate or a loss. Putting the
+  stamp outside the target database (e.g., DynamoDB) makes stamping
+  non-atomic with the row and turns recovery into a correctness problem
+  rather than a bookkeeping one.
+- **Trade-off.** The stamp table grows forever unless pruned (acceptable at
+  current scale), and one extra SELECT per record on replay.
+
+### 3.5 State plane co-located in the target DSQL cluster
+
+Six tables — applied-stamps, DLQ fence, DLQ payload, checkpoints, shard
+leases, watermark state — all live inside the target DSQL cluster alongside
+the user data.
+
+- **Why.** Every correctness-critical state transition ("apply the row, mark
+  it applied, close the fence that covered it, advance the checkpoint") can
+  happen in one target-side transaction. There is no distributed-state
+  coordination problem to engineer around. One IAM boundary, one failure
+  domain.
+- **Trade-off.** Writes to the target include replicator overhead. Losing
+  the target cluster means losing the state plane. The replicator's
+  reliability is bounded by the target cluster's.
+
+An earlier design kept checkpoints and watermark state in DynamoDB and only
+moved DLQ into target DSQL. That contradicted the stated principle "state
+lives where the applier runs" and introduced cross-service consistency logic
+for the lease. We reversed it, consolidated to six tables in the target
+cluster, and deleted the DynamoDB infrastructure.
+
+### 3.6 Single-writer per shard, enforced by a fencing-token lease
+
+Only one Fargate task actively owns a shard at a time, enforced by a lease
+row in the target cluster with a monotonic token and a periodic heartbeat.
+The service runs at `desiredCount=1`; the lease is for failover, not
+horizontal scale.
+
+- **Why.** Two tasks each with their own commit lane could commit
+  transactions out of order relative to each other and break the per-key
+  ordering guarantee. A shared cross-task commit lane via an advisory lock
+  just serializes everything anyway. The fencing token makes stale wake-ups
+  safe: a paused-then-resumed process finds its token no longer current and
+  shuts its shard worker down cleanly.
+- **Trade-off.** Per-process throughput is the system's throughput ceiling.
+  Horizontal scale would require weakening the cross-shard ordering
+  guarantee or introducing cross-task coordination; neither is shipped.
+
+### 3.7 DLQ "fence" as a durable, inspectable per-transaction quarantine
+
+When a transaction fails permanently to apply (schema mismatch, constraint
+violation, unknown table), the applier writes one fence row to the target
+cluster and a payload row preserving the whole transaction. The ordering
+stage refuses to release any transaction past the fence timestamp until an
+operator closes it. Retry re-applies the stored payload and closes the fence
+inside one target transaction.
+
+- **Why.** Silently skipping diverges the target. Retrying forever loses
+  forward progress. Crashing the process is operator-hostile and loses
+  in-flight state. A durable, inspectable fence pinned to the exact failing
+  transaction is the only option that preserves correctness and gives
+  operators a one-command recovery. Keeping the payload in the target means
+  retry is a pure target-side operation — no Kinesis replay needed.
+- **Trade-off.** The current fence is **global** — any one failure halts
+  all forward progress. Per-primary-key quarantine (hold only transactions
+  touching the fenced keys) is a possible extension. Today's behavior is
+  correct, just more disruptive than it needs to be.
+
+### 3.8 DDL is explicitly not replicated
+
+The applier assumes schemas exist on both sides. When it hits an unknown
+table or column, it raises an apply error, which opens a fence; the operator
+applies the DDL on the target and runs retry.
+
+- **Why.** Inferring DDL from CDC is brittle. Column renames, type changes,
+  index creation, triggers, and defaults all fail in different ways. Getting
+  it wrong on a production replica is worse than making the operator
+  responsible.
+- **Trade-off.** Schema changes become a two-step operator process. In
+  return, the replicator never invents target schema and never silently
+  diverges on DDL drift.
+
+### 3.9 Source → Kinesis → target topology (not direct DB-to-DB)
+
+The replicator reads a Kinesis stream owned by the customer (fed by DSQL CDC
+in the source region) and commits to a target DSQL cluster in a different
+region.
+
+- **Why.** Kinesis is the DSQL CDC emission surface — there is no direct
+  outbound CDC stream from DSQL. Kinesis also gives durable buffering during
+  replicator downtime (24-hour retention, extendable to 7 days) and a
+  natural fan-out point for additional consumers.
+- **Trade-off.** Source-to-target latency includes CDC emission lag,
+  Kinesis delivery, and cross-region commit. In practice this runs
+  single-digit seconds under normal load.
+
+### 3.10 IAM-token auth with per-connection reconnect on expiry
+
+Both Kinesis and both DSQL clusters authenticate via IAM-generated
+short-lived tokens (~15 minutes). Every long-running connection — state
+connection, DLQ writer, schema cache — wraps each operation in a one-retry
+loop that reconnects on expired-token errors. The container also writes a
+liveness heartbeat file that the healthcheck reads.
+
+- **Why.** DSQL does not offer long-lived credentials. An earlier revision
+  had reconnect only on the applier's commit lane; stress testing exposed
+  that the state connection wedged silently after ~35 minutes when its
+  token expired, while the container healthcheck still passed because it
+  opened fresh connections. We added per-connection reconnect everywhere
+  plus the liveness heartbeat so any future wedge — not just token expiry —
+  fails the healthcheck.
+- **Trade-off.** Every long-lived connection carries its own reconnect
+  logic. The alternative (a centralized token refresher) is less local and
+  more error-prone.
+
+### 3.11 Fargate single-task deployment with CloudWatch alarms (not Lambda, not EKS)
+
+The replicator runs as one Fargate task behind an ECS service with the
+deployment circuit breaker enabled. The task role is scoped to one Kinesis
+stream, two DSQL cluster ARNs, two SNS topics, and one CloudWatch namespace.
+Five alarms (apply failures, open fence, ordering buffer near cap, watermark
+lag, Kinesis records-behind-latest) publish to a dedicated SNS topic. A
+customer-managed KMS key encrypts both SNS topics at rest.
+
+- **Why.** Lambda's execution limits make long-running CDC consumption
+  impractical. EKS adds a cluster to operate for one container. Fargate is
+  the lightest shape that gives a long-running task, native CloudWatch
+  integration, and healthchecks. One task matches the single-writer-per-
+  shard contract.
+- **Trade-off.** Monthly cost (dominated by the NAT gateway and interface
+  endpoints). Horizontal scale would require weakening the ordering
+  contract first.
+
+---
+
+## 4. What these choices solve, by failure class
+
+**Correctness.** Duplicate deliveries and operator retries never produce
+duplicate rows on the target (per-transaction stamp table). Partial
+transactions never become visible to target readers (reassembly before
+release + one-transaction atomic apply). Out-of-order delivery within a
+transaction is absorbed by the grouping stage; out-of-order delivery across
+shards is absorbed by the ordering stage.
+
+**Liveness.** A stuck transaction opens a durable fence rather than crashing
+the process or looping forever. Expired IAM tokens trigger an in-process
+reconnect on the next operation. An operator-initiated pause reuses the
+fence mechanism, so there is one halting primitive, not two. Idle shards get
+a synthetic watermark advance when Kinesis itself reports they are caught
+up, so a quiet shard does not freeze the pipeline. Ordering-buffer
+back-pressure stops advancing the Kinesis iterator rather than silently
+dropping records.
+
+**Operability.** Failover is clean: the shard lease lives next to the data
+its owner is writing, with a heartbeat and a fencing token. Lag visibility
+comes from a dashboard with single-value tiles for the four signals an
+on-call reads first, plus five alarms with decision trees in the runbook.
+The blast radius of a bad write is bounded by the fence — forward progress
+halts, nothing silently diverges. The runbook explicitly tells on-call what
+NOT to do: there is no DynamoDB to touch, SSH is rarely needed, Kinesis
+replay is unnecessary because the stored payload makes retry a pure
+target-side operation.
+
+**Scaling.** Per-key parallel apply unlocks throughput for workloads whose
+keys are reasonably distributed (measured roughly 6× transaction and 12× DML
+improvement over the prior serial lane). Hot-key workloads cap at ~3
+updates/second per unique primary key — cross-region commit latency is
+physics, not software. Backlog grows linearly, not exponentially, under
+sustained over-load and drains after load stops. The system is stable under
+over-provisioning, not runaway.
+
+---
+
+## 5. Known limits
+
+- **Steady-state apply ceiling** on the single-task shape is ~250 TPS
+  cross-region. Above that, lag grows linearly and drains post-load.
+  Multi-task scale with weakened cross-shard ordering is a possible
+  extension; not shipped.
+- **Hot-key workloads** cap at ~3 updates/second per unique primary key.
+- **DDL is not replicated** — operator applies schema changes to both
+  clusters out of band.
+- **Service runs at `desiredCount=1`.** The lease model is for failover, not
+  throughput.
+- **Historical rows written before the replicator was started cannot be
+  bridged** — Kinesis retention is 24 hours (extendable to 7 days). The
+  design surfaces this as a CloudWatch metric so an alarm fires before data
+  is lost.
+- **Cross-row application-level atomicity across the replica is not
+  preserved** — only per-row order. This matches standard CDC behavior.
+- **One source feeds one target per consumer process.** Fan-out to multiple
+  targets means running multiple processes.
+- **No HTTPS admin surface** — all operator actions are CLI-driven.
+- **Source Kinesis stream's KMS encryption** is a one-time operator step on
+  prod cutover, not a CDK takeover, because changing stream encryption
+  affects every producer and consumer of the stream.
+
+---
+
+## 6. Key reversals during design
+
+Each of these is a design iteration driven by an observed failure, not an a
+priori preference. They are the parts of the design most worth challenging.
+
+1. **Global timestamp ordering → per-key stripe-locked apply.** A 15-minute
+   100 TPS load test proved the serial-applier ceiling at ~5–7 DMLs/sec on
+   cross-region commits. Insufficient for any real OLTP workload. The
+   reversal weakened the ordering contract to per-row (what SQL guarantees
+   anyway) and unlocked the throughput ceiling.
+
+2. **State plane in DynamoDB → state plane in target DSQL.** An earlier
+   design kept checkpoints and watermark state in DynamoDB and only moved
+   DLQ into target DSQL. That contradicted "state lives where the applier
+   runs" and introduced cross-service consistency logic. The reversal
+   consolidated to six tables in the target cluster.
+
+3. **Narrower task role → kept the slightly broader DLQ permission.** A
+   stricter "list-only" variant for the DLQ SNS topic tripped the ECS
+   deployment circuit breaker during the rollout window where the new
+   (narrower) task role rolled out before the new image. The idempotent
+   create permission is kept because tightening it broke rolling deploys.
+
+4. **Applier-only reconnect → every long-lived connection reconnects.** A
+   500 TPS stress test exposed that the state connection wedged silently
+   after ~35 minutes when its IAM token expired. The container healthcheck
+   still passed. Per-connection reconnect everywhere, plus a
+   liveness-heartbeat file so any future wedge — not just token expiry —
+   fails the healthcheck.
