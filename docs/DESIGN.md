@@ -438,3 +438,61 @@ fix; not shipped.
   full `cdk deploy` and preserves the running backlog.
 - Validate the pool warm-up stagger with a 128-worker cold start before
   concluding a connection-limit theory.
+
+### 2026-10-26 — Follow-up: the "DSQL cap" was actually stripe-lock contention
+
+The initial writeup above hypothesized a target-DSQL concurrent-write cap
+to explain the 88-TPS plateau. **That was wrong.** Per-stage timing added
+after the writeup (commit `29850a3`) revealed the real cost sink:
+
+| Stage | p50 | p95 | max |
+|---|---|---|---|
+| schema_ms | 0.1 | 0.1 | 0.1 |
+| pool_wait_ms | 0.0 | 0.0 | 0.0 |
+| commit_ms | 230 | 327 | 327 |
+| **stripe_ms** | **842** | **24,583** | **31,773** |
+
+The applier was spending **24+ seconds at p95 just waiting to acquire the
+asyncio stripe locks** before a batch could begin. `duration_ms` in the
+`apply.ok` log timers only the commit itself — it starts AFTER stripes are
+held — so this wait was invisible in every earlier observation.
+
+Why Fargate CPU looked idle: `asyncio.Lock.acquire()` is pure sleep. The
+process was waiting, not doing work.
+
+**Collision math.** `BATCH_MAX_TXNS=2` × ~3.5 records/txn → ~7 stripes per
+batch. With 512 stripes and 128 workers:
+
+- P(two batches disjoint) = (505/512)^7 ≈ 0.91
+- P(a new batch collides with any of K in flight) = 1 − 0.91^K
+- At K=128 the collision probability is essentially 1.0.
+
+Every new batch queued behind at least one in-flight batch; cumulative
+queue depth × commit_ms matched the ~24 s p95 we observed.
+
+**Fix.** `APPLIER_STRIPES=512 → 8192`:
+
+- P(disjoint) → (8185/8192)^7 ≈ 0.994
+- P(collision at K=128) → ~54 % → p99 ~1 s instead of ~30 s
+
+Measured result on task-def `:22`:
+
+- stripe_ms p50 **842 → 0.0 ms**, p95 **24,583 → 556 ms**
+- Fargate CPU **190 → 984 CpuUnits** (idle → ~1 full vCPU of real work)
+- Applier TPS **88 → ~700 TPS** steady, over source target of 600
+
+**CDK default updated** to `APPLIER_STRIPES=8192`.
+
+**Lesson.** The invariant for `APPLIER_STRIPES` is: it must be ≫
+`APPLIER_WORKERS × (max stripes per batch)` or workers queue on locks and
+the pipeline floor is the serial RTT. Rule of thumb: stripe count = 64 ×
+worker count, minimum. The 2026-10-14 build had `applier_stripes = 512,
+applier_workers = 32` — ratio of 16× — which happened to work at low
+concurrency; today's 128-worker shape crossed the threshold where it
+collapses.
+
+**Credit.** User pushed back on the "server-side cap" hypothesis before I
+had evidence. Instrumentation then confirmed the client-side pathology.
+Lesson for future debugging: **time every stage, don't just time the
+commit** — invisible wait inside asyncio locks is a classic Python
+performance footgun.

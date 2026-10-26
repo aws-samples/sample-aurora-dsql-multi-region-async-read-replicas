@@ -117,32 +117,35 @@ Cross-region, zero apply errors, no fences opened.
 | Serial lane (baseline) | 32 / 64 / 1 | ~8 | ~27 |
 | Vertical scale | 128 / 256 / 2 | ~24 | ~85 |
 | Vertical push | 256 / 512 / 4 | ~250 | ~870 |
-| **Micro-batching + multi-proc (2026-10-26)** | 128 or 256 / 512 / 8 | **~88** | **~310** |
+| Early 2026-10-26 (stripes=512) | 128 / 512 / 8 | ~88 | ~310 |
+| **2026-10-26 after stripe fix** | **128 / 8192 / 8** | **~700** | **~2,400** |
 
-Source side load-tested at 530 TPS for 30 min against the dsql cluster
+Source side load-tested at 533 TPS for 7 min against the dsql cluster
 `kbud4lp76tyvoj5zligoi5otlm.dsql.us-east-1.on.aws` with zero errors, zero
-fences, zero credential rotations lost; the credential-rotation fix (commit
-`6286c6f`) was validated in the same run.
+fences, zero credential rotations lost. The credential-rotation fix
+(commit `6286c6f`) was validated across both the 30-min and the 7-min
+runs. Applier TPS (~700) exceeded the source TPS (~533) and drained
+the ordering buffer backlog from the earlier 30-min run.
 
-### The 2026-10-26 ceiling
+### Earlier "88 TPS cap" — a client-side regression, not a server limit
 
-The micro-batching + multi-process build (commits `6187127`, `89a4907`,
-`5c07676`) measured a **~88 TPS applier ceiling that did not move** when
-`APPLIER_WORKERS` was raised from 128 → 256 or when `BATCH_MAX_TXNS` was
-tuned 1 → 16. Target Fargate CPU stayed below 20% of one vCPU; the pool had
-118+ idle connections at all times; `stripes_count` per batch was ~2 (vs.
-~50 under `BATCH_MAX_TXNS=16` which previously masked the limit as apparent
-stripe-lock contention). The ceiling appears to be a target-DSQL
-concurrent-write cap enforced server-side rather than any client-side
-knob. See `docs/DESIGN.md` for the measurement writeup and open hypotheses.
+Our 09:xx run claimed a target-DSQL concurrent-write cap. **That was
+wrong.** Per-stage instrumentation (commit `29850a3`) showed the real
+cost was `asyncio.Lock` contention on `APPLIER_STRIPES`. With 128
+workers each acquiring ~7 of only 512 stripes, collision probability
+was ~99 % per queue-position, and `stripe_ms` was 24+ seconds at p95
+despite healthy commit times. Raising `APPLIER_STRIPES` to 8192 dropped
+`stripe_ms` to near zero and lifted the applier from 88 → ~700 TPS.
+Full writeup in `docs/DESIGN.md`.
 
 ---
 
 ## Known limits
 
-- **Target-side concurrent-write ceiling (~88 TPS/cluster)**: the dominant
-  limit on this build. Not related to connection count, pool size, workers,
-  stripes, or batching. Investigation open (see `docs/DESIGN.md`).
+- **`APPLIER_STRIPES` must be ≫ `APPLIER_WORKERS × avg_stripes_per_batch`**
+  or workers queue on asyncio stripe locks and the applier floor collapses
+  to the serial RTT. Rule of thumb: `STRIPES ≥ 64 × WORKERS`. CDK default
+  is now 8192 for 128 workers. See `docs/DESIGN.md` for the derivation.
 - **Multi-process shard-starvation**: with `REPLICATOR_PROCESSES > 1` and
   shards ≤ children, the first process to acquire a shard lease keeps it;
   siblings sit idle. The GIL-relief multi-process is intended to deliver is

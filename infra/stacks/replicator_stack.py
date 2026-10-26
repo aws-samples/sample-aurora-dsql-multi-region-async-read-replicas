@@ -255,7 +255,10 @@ class DsqlReplicatorStack(cdk.Stack):
                 # concurrent apply lanes to target = 256 (same as prior single-proc).
                 "REPLICATOR_PROCESSES": "2",
                 "APPLIER_WORKERS": "128",
-                "APPLIER_STRIPES": "512",
+                # STRIPES must dwarf APPLIER_WORKERS * stripes-per-batch, else
+                # workers queue on asyncio stripe locks and CPU stays ~2 %. See
+                # 2026-10-26 stripe-contention finding in docs/DESIGN.md.
+                "APPLIER_STRIPES": "8192",
                 # Micro-batching (A): 16 source txns per cross-region commit, flush
                 # partial batches after 50 ms so steady-state latency stays bounded.
                 "BATCH_MAX_TXNS": "16",
