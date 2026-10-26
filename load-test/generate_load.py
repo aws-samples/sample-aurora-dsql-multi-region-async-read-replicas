@@ -3,7 +3,7 @@
 
 Spawns N async workers that commit transactions against the source DSQL cluster
 at a fixed aggregate transactions-per-minute target. Each transaction performs
-2-5 random DMLs (insert/update/delete) on the `load_test` table.
+2-5 random DMLs (insert/update/delete) on the `{table}` table.
 
 Reports per-minute throughput and p50/p95/p99 commit latency; dumps a final
 JSON report with the full timeline.
@@ -97,7 +97,7 @@ def gen_payload() -> str:
     return "x" * n
 
 
-def gen_dmls(recent_ids: Deque[uuid.UUID]) -> list[tuple[str, tuple]]:
+def gen_dmls(recent_ids: Deque[uuid.UUID], table: str) -> list[tuple[str, tuple]]:
     """Build 2-5 DMLs for a single transaction. Returns (sql, params) tuples."""
     n = random.randint(2, 5)
     stmts: list[tuple[str, tuple]] = []
@@ -108,7 +108,7 @@ def gen_dmls(recent_ids: Deque[uuid.UUID]) -> list[tuple[str, tuple]]:
             recent_ids.append(new_id)
             stmts.append(
                 (
-                    "INSERT INTO load_test (id, bucket, payload) VALUES (%s, %s, %s)",
+                    f"INSERT INTO {table} (id, bucket, payload) VALUES (%s, %s, %s)",
                     (new_id, random.randint(1, 100), gen_payload()),
                 )
             )
@@ -116,7 +116,7 @@ def gen_dmls(recent_ids: Deque[uuid.UUID]) -> list[tuple[str, tuple]]:
             target = random.choice(list(recent_ids))
             stmts.append(
                 (
-                    "UPDATE load_test SET payload = %s, updated_at = now() WHERE id = %s",
+                    f"UPDATE {table} SET payload = %s, updated_at = now() WHERE id = %s",
                     (gen_payload(), target),
                 )
             )
@@ -126,7 +126,7 @@ def gen_dmls(recent_ids: Deque[uuid.UUID]) -> list[tuple[str, tuple]]:
                 recent_ids.remove(target)
             except ValueError:
                 pass
-            stmts.append(("DELETE FROM load_test WHERE id = %s", (target,)))
+            stmts.append((f"DELETE FROM {table} WHERE id = %s", (target,)))
     return stmts
 
 
@@ -140,6 +140,7 @@ async def worker(
     minutes: dict[int, MinuteBucket],
     minutes_lock: asyncio.Lock,
     started_at: float,
+    table: str,
     start_delay_sec: float = 0.0,
 ) -> None:
     if start_delay_sec > 0:
@@ -165,7 +166,7 @@ async def worker(
                 await asyncio.sleep(1.0)
                 continue
 
-        stmts = gen_dmls(recent_ids)
+        stmts = gen_dmls(recent_ids, table)
         t0 = time.monotonic()
         try:
             async with conn.transaction():
@@ -256,7 +257,7 @@ async def main_async(args: argparse.Namespace) -> None:
         asyncio.create_task(
             worker(
                 i, args.cluster_host, token_cache, rate_per_worker, stop_at, stats_list[i],
-                minutes, minutes_lock, started_at,
+                minutes, minutes_lock, started_at, args.table,
                 start_delay_sec=(ramp_sec * i / max(1, args.workers - 1)) if ramp_sec > 0 else 0.0,
             )
         )
@@ -342,6 +343,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--duration-sec", type=int, default=900)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--ramp-sec", type=float, default=0.0, help="stagger worker starts linearly over this window")
+    p.add_argument("--table", default="load_test", help="target table name for DML (must exist on source + target)")
     p.add_argument("--output", default=None)
     return p.parse_args()
 

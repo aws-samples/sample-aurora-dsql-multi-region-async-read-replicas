@@ -713,7 +713,7 @@ class ConsumerPipeline:
         if old is not None and not old.closed:
             with contextlib.suppress(Exception):
                 await old.close()
-        self._state_token_cache.get(force_refresh=True)
+        await self._state_token_cache.get_async(force_refresh=True)
         self._state_conn = await open_connection(self._target, self._state_token_cache, autocommit=True)
         log.info("state_conn.refreshed")
 

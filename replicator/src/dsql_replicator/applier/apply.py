@@ -134,15 +134,26 @@ class Applier:
     # ---- lifecycle ------------------------------------------------------
 
     async def start(self) -> None:
-        """Open worker connections + schema connection; bootstrap state tables."""
+        """Open worker connections + schema connection; bootstrap state tables.
+
+        Pool pre-warm is **staggered** (20 ms between connects) so N worker
+        connections don't hit the DSQL endpoint simultaneously. Without the
+        stagger, the 128-connection cold burst at task start combined with the
+        unlocked token cache produced correlated `SSL EOF` failures and opened
+        fences (incident: 2026-10-26). Total pre-warm time at 128 workers is
+        ~2.5 s + per-connect latency, dwarfed by the first-ever DSQL warmup.
+        """
         if self._schema_conn is not None:
             return
         self._schema_conn = await open_connection(self._endpoint, self._token_cache, autocommit=False)
         self._schema = SchemaCache(self._schema_conn)
         await self._bootstrap_tables()
-        for _ in range(self._worker_count):
+        for i in range(self._worker_count):
             conn = await open_connection(self._endpoint, self._token_cache, autocommit=False)
             await self._conn_pool.put(conn)
+            # Only stagger non-trivial pool sizes; 1-worker test setups skip.
+            if self._worker_count > 4 and i < self._worker_count - 1:
+                await asyncio.sleep(0.02)
 
     async def close(self) -> None:
         while not self._conn_pool.empty():
@@ -479,18 +490,34 @@ class Applier:
     async def _replace_conn(
         self, old: psycopg.AsyncConnection[tuple[object, ...]]
     ) -> psycopg.AsyncConnection[tuple[object, ...]]:
-        """Close a broken connection + open a fresh one with refreshed token."""
+        """Close a broken connection + open a fresh one with refreshed token.
+
+        Does its own bounded retry loop (3 attempts, exp backoff) before giving up.
+        On total failure returns the (now-closed) old conn — the outer retry loop
+        will treat it as `_RETRYABLE` and come back here on the next attempt.
+        The old `return old` path with a LIVE broken socket caused the 2026-10-26
+        SSL-EOF fence storm: all 5 outer retries looped on the same dead socket.
+        """
         if not old.closed:
             try:
                 await old.close()
             except Exception as exc:
                 log.debug("apply.close.quiet", error=str(exc))
-        try:
-            self._token_cache.get(force_refresh=True)
-            return await open_connection(self._endpoint, self._token_cache, autocommit=False)
-        except Exception as exc:
-            log.warning("apply.reconnect.failed", error=str(exc))
-            return old
+        for inner in range(1, 4):  # 3 attempts, bounded so caller's budget still shrinks
+            try:
+                await self._token_cache.get_async(force_refresh=True)
+                return await open_connection(self._endpoint, self._token_cache, autocommit=False)
+            except Exception as exc:
+                log.warning(
+                    "apply.reconnect.failed",
+                    attempt=inner,
+                    error=str(exc),
+                )
+                if inner < 3:
+                    await asyncio.sleep(self._backoff(inner))
+        # All inner attempts failed. Return the closed `old` — the outer except
+        # block's next iteration will catch IOError on it and come back here.
+        return old
 
     def _backoff(self, attempt: int) -> float:
         upper = min(self._backoff_cap, self._backoff_initial * (2 ** (attempt - 1)))
@@ -507,7 +534,7 @@ class Applier:
                 await old.close()
             except Exception as exc:
                 log.debug("schema_conn.close.quiet", error=str(exc))
-        self._token_cache.get(force_refresh=True)
+        await self._token_cache.get_async(force_refresh=True)
         self._schema_conn = await open_connection(self._endpoint, self._token_cache, autocommit=False)
         self._schema.set_conn(self._schema_conn)
         log.info("schema_conn.refreshed")
