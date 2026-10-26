@@ -355,3 +355,86 @@ priori preference. They are the parts of the design most worth challenging.
    still passed. Per-connection reconnect everywhere, plus a
    liveness-heartbeat file so any future wedge — not just token expiry —
    fails the healthcheck.
+
+---
+
+## 2026-10-26 — Measurement, incidents, and the applier ceiling
+
+### What landed this day
+1. **Cross-shard transaction reassembly** (`6187127`): a `TransactionReassembler`
+   that lived per-shard worker silently dropped ~90% of transactions on
+   multi-shard streams. CDC distributes a single source transaction's records
+   across every open shard, so each per-shard reassembler timed out with
+   `buffered < expected`. Fix: one process-global reassembler plus a dedicated
+   sweeper task that emits `TxnTimeouts` so this failure mode is never silent.
+2. **Micro-batching (pattern A)** (`6187127`): `Applier.apply_batch(N)` packs N
+   source txns into one target `BEGIN...COMMIT`. Config knobs
+   `BATCH_MAX_TXNS` / `BATCH_MAX_WAIT_MS`. Fence/DLQ granularity stays
+   per-source-txn via a per-txn fallback on batch failure.
+3. **Multi-process supervisor (pattern C)** (`6187127`): `REPLICATOR_PROCESSES`
+   spawns N child consumer processes; children race for shard leases via the
+   existing table. CDK bumped 4 vCPU / 8 GB → 8 vCPU / 16 GB.
+4. **SSL-EOF connection-storm fix** (`89a4907`): `DsqlTokenCache` grew an
+   `asyncio.Lock`, moved SigV4 signing to a thread, and `_replace_conn`
+   retries open with backoff instead of handing back a known-broken socket.
+   Pool pre-warm staggers 20 ms per connection.
+5. **Load-gen credential rotation fix** (`6286c6f`): recreate `boto3.Session`
+   per token refresh, not just the client, so long runs survive ada rotation.
+6. **Dashboard SEARCH aggregation** (`5c07676`): widgets now use
+   `SUM/MAX(SEARCH(...))` so the dashboard works for `REPLICATOR_PROCESSES >= 1`
+   without rewriting per deploy. Prior widgets filtered on fixed dim sets and
+   went silent once the ProcessId dim was introduced.
+
+### Measurement outcome
+
+Source: 300 async workers, 30-min duration, 5-min ramp, source cluster
+`kbud4lp76tyvoj5zligoi5otlm` → Kinesis `my-cdc-stream` (4 shards). Target:
+`djue5mkorsu6v67bw4jise6qna` (us-east-2).
+
+- **Source**: 952,734 txns committed in 30 min, zero failures, effective
+  ~529 TPS; p50/p95/p99 at 459 / 889 / 1,226 ms.
+- **Applier**: steady 87–93 TPS. No fences. No apply errors. Zero retries
+  observed in logs.
+- **p1 process**: 0 txns throughout. See "Open limits" below.
+
+### Open limits (not fixed this day)
+
+**Target-DSQL concurrent-write ceiling.** The applier plateaued at ~88 TPS
+and did **not** move with any client-side knob:
+
+| Change | Expected (theory) | Observed |
+|---|---|---|
+| `BATCH_MAX_TXNS=16 → 2` | ~500 TPS from stripe-overlap relief | 11 → 88 TPS |
+| `APPLIER_WORKERS=128 → 256` | ~2× if connection-bound | **unchanged** |
+
+Signals that argue against client-side:
+- Fargate CPU: <20 % of **one** vCPU (task has 8).
+- Connection pool: 118+ idle slots at all times.
+- Per-batch `stripes_count`: ~2 of 512 (overlap <1 %).
+- Per-batch commit `duration_ms`: 187-290 (healthy cross-region).
+- Zero fences, zero `_RETRYABLE` log lines.
+
+Working hypothesis: target DSQL enforces a per-cluster concurrent-commit
+cap (around 10 in-flight writes) that is not surfaced by connection or
+QPS quotas. Needs an AWS case to confirm; alternately, a side-by-side
+run against a fresh target cluster to see if the cap moves. Pending.
+
+**Multi-process shard starvation.** `REPLICATOR_PROCESSES=2` with 4 shards:
+p0 wins all 4 leases first, p1 idles. The GIL relief multi-process is meant
+to buy only works when `shards >= processes`. Horizontal task scale with
+deterministic shard partition `shard_hash % N == task_id` is the general
+fix; not shipped.
+
+### Lessons for next time
+
+- When a server-side error correlates perfectly with cold-start client
+  bursts (`SSL EOF`, `access denied`, `connection reset by peer`), look
+  for an **unlocked boto3 call** on the hot path before blaming the
+  server. SigV4 signing calls at 128× concurrency saturate client-side
+  resolver code and present as server errors.
+- Monitor **both** source and dashboard widgets' dim schema when a feature
+  touches metrics emission. Dim mismatch is silent on both ends.
+- Hot-swap task-def env vars for one-knob experiments; faster than a
+  full `cdk deploy` and preserves the running backlog.
+- Validate the pool warm-up stagger with a 128-worker cold start before
+  concluding a connection-limit theory.
