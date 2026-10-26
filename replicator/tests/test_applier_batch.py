@@ -100,7 +100,9 @@ async def test_apply_batch_computes_union_of_touched_stripes(monkeypatch: pytest
     applier = _FakeStripeHashApplier(stripe_count=4)
     seen: list[int] = []
 
-    async def fake_apply_batch_with_retry(txns: Any, hook: Any, stripes: tuple[int, ...]) -> list[Any]:
+    async def fake_apply_batch_with_retry(
+        txns: Any, hook: Any, stripes: tuple[int, ...], **_: Any
+    ) -> list[Any]:
         seen.extend(stripes)
         return []
 
