@@ -62,13 +62,16 @@ class TokenCache:
         self.host = host
         self.region = region
         self.endpoint_url = endpoint_url
-        self.client = boto3.client("dsql", region_name=region, endpoint_url=endpoint_url)
         self._token: str | None = None
         self._issued_at = 0.0
 
     def get(self) -> str:
         if self._token is None or time.monotonic() - self._issued_at > TOKEN_REFRESH_SEC:
-            self._token = self.client.generate_db_connect_admin_auth_token(
+            # Recreate the boto3 client each refresh so a fresh Session re-reads
+            # ~/.aws/credentials — otherwise long-running loads outlive their IAM
+            # session TTL and DSQL rejects every connection as "access denied".
+            client = boto3.client("dsql", region_name=self.region, endpoint_url=self.endpoint_url)
+            self._token = client.generate_db_connect_admin_auth_token(
                 Hostname=self.host, Region=self.region
             )
             self._issued_at = time.monotonic()
