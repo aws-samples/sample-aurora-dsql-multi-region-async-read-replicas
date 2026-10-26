@@ -27,6 +27,7 @@ Applier (acts as one lock, one connection).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import random
 import time
@@ -125,6 +126,12 @@ class Applier:
         self._conn_pool: asyncio.Queue[psycopg.AsyncConnection[tuple[object, ...]]] = asyncio.Queue(
             maxsize=self._worker_count
         )
+        # Track each pool connection's open time so we can proactively recycle
+        # before the IAM token (TTL ~15 min) expires server-side. Without this,
+        # the first apply after a 15 min idle period hits dead sockets on every
+        # retry and fences (incident: 2026-10-26 pool-idle SSL-EOF).
+        self._conn_opened_mono: dict[int, float] = {}
+        self._conn_max_age_s: float = 12 * 60.0  # recycle before 15-min token TTL
         self._schema_conn: psycopg.AsyncConnection[tuple[object, ...]] | None = None
         self._schema: SchemaCache | None = None
         self._bootstrapped = False
@@ -150,6 +157,7 @@ class Applier:
         await self._bootstrap_tables()
         for i in range(self._worker_count):
             conn = await open_connection(self._endpoint, self._token_cache, autocommit=False)
+            self._conn_opened_mono[id(conn)] = time.monotonic()
             await self._conn_pool.put(conn)
             # Only stagger non-trivial pool sizes; 1-worker test setups skip.
             if self._worker_count > 4 and i < self._worker_count - 1:
@@ -160,9 +168,38 @@ class Applier:
             conn = self._conn_pool.get_nowait()
             if not conn.closed:
                 await conn.close()
+        self._conn_opened_mono.clear()
         if self._schema_conn is not None and not self._schema_conn.closed:
             await self._schema_conn.close()
         self._schema_conn = None
+
+    async def _borrow_fresh_conn(self) -> psycopg.AsyncConnection[tuple[object, ...]]:
+        """Pop a connection from the pool; if its token is near expiry, recycle it.
+
+        DSQL IAM tokens live ~15 min. A pool connection opened at task start sits
+        with an aging token every time the pool is quiet. Server-side the token
+        expires and the next first-use read EOFs — which produced the 2026-10-26
+        post-idle fence storm. We proactively close and reopen any conn whose
+        open-age exceeds `_conn_max_age_s` (12 min, with a buffer under the TTL).
+        """
+        conn = await self._conn_pool.get()
+        opened_at = self._conn_opened_mono.pop(id(conn), 0.0)
+        if conn.closed or (time.monotonic() - opened_at) >= self._conn_max_age_s:
+            # Replace a stale (or externally-closed) conn before handing it out.
+            if not conn.closed:
+                with contextlib.suppress(Exception):
+                    await conn.close()
+            try:
+                await self._token_cache.get_async(force_refresh=True)
+                conn = await open_connection(self._endpoint, self._token_cache, autocommit=False)
+                log.debug("conn.recycle", age_s=round(time.monotonic() - opened_at, 1))
+            except Exception as exc:
+                # Open failed; retry loop will handle; return a closed sentinel.
+                log.warning("conn.recycle.open_failed", error=str(exc))
+                # Still return the (now closed) conn so the pool invariant holds;
+                # the retry loop treats closed conns as retryable.
+        self._conn_opened_mono[id(conn)] = time.monotonic()
+        return conn
 
     async def _bootstrap_tables(self) -> None:
         if self._bootstrapped:
@@ -272,7 +309,7 @@ class Applier:
         """Retry loop around `_apply_once`, scoped to a pool-borrowed connection."""
         last_exc: BaseException | None = None
         for attempt in range(1, self._max_retries + 1):
-            conn = await self._conn_pool.get()
+            conn = await self._borrow_fresh_conn()
             t0 = time.monotonic()
             try:
                 rows_applied, rows_deduped = await self._apply_once(conn, txn, pre_commit_hook)
@@ -340,7 +377,7 @@ class Applier:
         last_exc: BaseException | None = None
         for attempt in range(1, self._max_retries + 1):
             t_pool0 = time.monotonic()
-            conn = await self._conn_pool.get()
+            conn = await self._borrow_fresh_conn()
             pool_ms = (time.monotonic() - t_pool0) * 1000.0
             t0 = time.monotonic()
             try:
@@ -519,6 +556,7 @@ class Applier:
         The old `return old` path with a LIVE broken socket caused the 2026-10-26
         SSL-EOF fence storm: all 5 outer retries looped on the same dead socket.
         """
+        self._conn_opened_mono.pop(id(old), None)
         if not old.closed:
             try:
                 await old.close()
@@ -527,7 +565,9 @@ class Applier:
         for inner in range(1, 4):  # 3 attempts, bounded so caller's budget still shrinks
             try:
                 await self._token_cache.get_async(force_refresh=True)
-                return await open_connection(self._endpoint, self._token_cache, autocommit=False)
+                new_conn = await open_connection(self._endpoint, self._token_cache, autocommit=False)
+                self._conn_opened_mono[id(new_conn)] = time.monotonic()
+                return new_conn
             except Exception as exc:
                 log.warning(
                     "apply.reconnect.failed",
