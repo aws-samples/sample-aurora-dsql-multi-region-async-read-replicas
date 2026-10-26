@@ -199,6 +199,55 @@ class Applier:
             return await self._apply_with_retry(txn, pre_commit_hook, tuple(sorted_stripes))
         raise ApplyError(f"unreachable: AsyncExitStack escaped for tx_id={txn.tx_id}")
 
+    async def apply_batch(
+        self,
+        txns: list[CompletedTransaction],
+        *,
+        pre_commit_hook: CursorHook | None = None,
+    ) -> list[ApplyResult]:
+        """Apply N source transactions in a single target-side BEGIN..COMMIT.
+
+        One cross-region commit RTT amortizes N source txns. Correctness:
+
+        - Union of touched stripes is acquired in sorted order once per batch,
+          same deadlock-free protocol as single-txn apply.
+        - DMLs run in the caller's txn order; within one target transaction,
+          later writes to the same PK overwrite earlier ones (per-key order).
+        - Each source txn still writes its own `__replicator_applied` rows in
+          the same commit — replay dedupes exactly as the single-txn path.
+
+        On a non-retryable commit failure, raises `ApplyError`. The caller
+        (`consumer.pipeline._apply_batch`) falls back to per-txn `apply()` so
+        the fence/DLQ granularity stays one-per-source-txn.
+        """
+        if not txns:
+            return []
+        if self._schema is None:
+            raise ApplyError("Applier.start() must be called before apply_batch()")
+
+        touched: set[int] = set()
+        for attempt in range(2):
+            try:
+                touched = set()
+                for t in txns:
+                    touched |= await self._compute_touched_stripes(t)
+                break
+            except SchemaNotFoundError as exc:
+                raise ApplyError(f"schema missing on target: {exc}") from exc
+            except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+                if attempt == 0:
+                    log.warning("schema_conn.reconnect", error=str(exc))
+                    await self._refresh_schema_conn()
+                    continue
+                raise ApplyError(f"schema connection failure: {exc}") from exc
+        sorted_stripes = sorted(touched)
+
+        async with AsyncExitStack() as stack:
+            for s in sorted_stripes:
+                await stack.enter_async_context(self._stripes[s])
+            return await self._apply_batch_with_retry(txns, pre_commit_hook, tuple(sorted_stripes))
+        raise ApplyError(f"unreachable: AsyncExitStack escaped for batch of {len(txns)}")
+
     async def _apply_with_retry(
         self,
         txn: CompletedTransaction,
@@ -262,6 +311,81 @@ class Applier:
             if pre_commit_hook is not None:
                 await pre_commit_hook(cur)
         return rows_applied, rows_deduped
+
+    async def _apply_batch_with_retry(
+        self,
+        txns: list[CompletedTransaction],
+        pre_commit_hook: CursorHook | None,
+        stripes: tuple[int, ...],
+    ) -> list[ApplyResult]:
+        """Retry loop around `_apply_batch_once`, scoped to a pool-borrowed connection."""
+        last_exc: BaseException | None = None
+        for attempt in range(1, self._max_retries + 1):
+            conn = await self._conn_pool.get()
+            t0 = time.monotonic()
+            try:
+                per_txn = await self._apply_batch_once(conn, txns, pre_commit_hook)
+                duration_ms = (time.monotonic() - t0) * 1000.0
+                return [
+                    ApplyResult(
+                        tx_id=txn.tx_id,
+                        rows_applied=applied,
+                        rows_deduped=deduped,
+                        attempt=attempt,
+                        duration_ms=duration_ms,
+                        stripes=stripes,
+                    )
+                    for txn, (applied, deduped) in zip(txns, per_txn, strict=True)
+                ]
+            except _RETRYABLE as exc:
+                last_exc = exc
+                await self._rollback_quiet(conn)
+                log.warning(
+                    "apply_batch.retryable",
+                    size=len(txns),
+                    attempt=attempt,
+                    error=str(exc),
+                )
+                conn = await self._replace_conn(conn)
+                if attempt < self._max_retries:
+                    await asyncio.sleep(self._backoff(attempt))
+            except SchemaNotFoundError as exc:
+                await self._rollback_quiet(conn)
+                raise ApplyError(f"schema missing on target: {exc}") from exc
+            except Exception as exc:
+                await self._rollback_quiet(conn)
+                log.error("apply_batch.permanent", size=len(txns), error=str(exc))
+                raise ApplyError(f"non-retryable batch failure: {exc}") from exc
+            finally:
+                await self._conn_pool.put(conn)
+        raise ApplyError(f"exhausted {self._max_retries} retries for batch of {len(txns)}: {last_exc}")
+
+    async def _apply_batch_once(
+        self,
+        conn: psycopg.AsyncConnection[tuple[object, ...]],
+        txns: list[CompletedTransaction],
+        pre_commit_hook: CursorHook | None,
+    ) -> list[tuple[int, int]]:
+        """One attempt against a pool-borrowed connection — one BEGIN..COMMIT for all txns."""
+        assert self._schema is not None
+        per_txn: list[tuple[int, int]] = []
+        async with conn.transaction(), conn.cursor() as cur:
+            for txn in txns:
+                rows_applied = 0
+                rows_deduped = 0
+                for rec in txn.records:
+                    stamped = await self._stamp(cur, txn.tx_id, _record_id(rec))
+                    if not stamped:
+                        rows_deduped += 1
+                        continue
+                    await self._apply_record(cur, rec)
+                    rows_applied += 1
+                    if self._fault_after_rows is not None and rows_applied >= self._fault_after_rows:
+                        raise InjectedFaultError(f"injected fault after {rows_applied} row(s), before COMMIT")
+                per_txn.append((rows_applied, rows_deduped))
+            if pre_commit_hook is not None:
+                await pre_commit_hook(cur)
+        return per_txn
 
     # ---- key hashing & stripe computation -------------------------------
 

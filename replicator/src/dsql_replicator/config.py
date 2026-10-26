@@ -101,6 +101,16 @@ class Config:
     applier_stripes: int
     applier_workers: int
 
+    # Micro-batching (A): pack multiple source txns into one target BEGIN...COMMIT.
+    # Size-or-time flush. One cross-region commit amortizes N source txns' RTT.
+    batch_max_txns: int
+    batch_max_wait_ms: int
+
+    # Multi-process (C): >1 spawns N child consumer processes (one asyncio loop each)
+    # so the GIL stops being the single-task throughput ceiling. Lease arbitration
+    # across children is the existing __replicator_shard_leases table.
+    replicator_processes: int
+
     # Observability
     metrics_namespace: str
 
@@ -140,5 +150,16 @@ class Config:
             metrics_interval_ms=_int("METRICS_INTERVAL_MS", 10_000),
             applier_stripes=_int("APPLIER_STRIPES", 64),
             applier_workers=_int("APPLIER_WORKERS", 32),
+            batch_max_txns=_int("BATCH_MAX_TXNS", 16),
+            batch_max_wait_ms=_int("BATCH_MAX_WAIT_MS", 50),
+            replicator_processes=_int("REPLICATOR_PROCESSES", 1),
             metrics_namespace=_optional("METRICS_NAMESPACE", "DSQLReplicator"),
         )
+
+    def __post_init__(self) -> None:
+        if self.batch_max_txns < 1:
+            raise ConfigError(f"BATCH_MAX_TXNS must be >= 1, got {self.batch_max_txns}")
+        if self.batch_max_wait_ms < 0:
+            raise ConfigError(f"BATCH_MAX_WAIT_MS must be >= 0, got {self.batch_max_wait_ms}")
+        if self.replicator_processes < 1:
+            raise ConfigError(f"REPLICATOR_PROCESSES must be >= 1, got {self.replicator_processes}")

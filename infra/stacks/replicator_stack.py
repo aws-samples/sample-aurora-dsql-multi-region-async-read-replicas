@@ -219,14 +219,17 @@ class DsqlReplicatorStack(cdk.Stack):
             container_insights_v2=ecs.ContainerInsights.ENABLED,
         )
 
-        # M7.0b vertical scaling: 4 vCPU / 8 GB — pushes the single-task ceiling with
-        # 256 workers + 512 stripe locks + 100k ordering buffer + 256 DSQL connections.
-        # Diminishing returns past this; above ~50 TPS the lever is horizontal scale.
+        # M7.0c vertical scaling + multi-process (A+C): 8 vCPU / 16 GB with
+        # REPLICATOR_PROCESSES=2 so each child owns its own asyncio loop and the GIL
+        # stops being the per-task ceiling. Each child runs 128 workers / 512 stripes,
+        # giving 2 x 128 = 256 total concurrent apply lanes against the target
+        # (same connection load as the previous single-process shape). Micro-batching
+        # (BATCH_MAX_TXNS=16) packs 16 source txns into one cross-region commit.
         task_def = ecs.FargateTaskDefinition(
             self,
             "TaskDef",
-            cpu=4096,
-            memory_limit_mib=8192,
+            cpu=8192,
+            memory_limit_mib=16384,
             task_role=task_role,
         )
         # obtain_execution_role materializes the role lazily; CDK already attaches the
@@ -248,9 +251,15 @@ class DsqlReplicatorStack(cdk.Stack):
                 "DLQ_SNS_TOPIC_NAME": dlq_sns_topic_name,
                 "CONTROL_REGION": source_region,
                 "LOG_LEVEL": "INFO",
-                # M7.0b vertical scaling — more concurrent apply lanes under larger task.
-                "APPLIER_WORKERS": "256",
+                # M7.0c: 2 child processes, each 128 workers / 512 stripes. Total
+                # concurrent apply lanes to target = 256 (same as prior single-proc).
+                "REPLICATOR_PROCESSES": "2",
+                "APPLIER_WORKERS": "128",
                 "APPLIER_STRIPES": "512",
+                # Micro-batching (A): 16 source txns per cross-region commit, flush
+                # partial batches after 50 ms so steady-state latency stays bounded.
+                "BATCH_MAX_TXNS": "16",
+                "BATCH_MAX_WAIT_MS": "50",
             },
             health_check=ecs.HealthCheck(
                 command=["CMD-SHELL", "dsql-replicator healthz || exit 1"],

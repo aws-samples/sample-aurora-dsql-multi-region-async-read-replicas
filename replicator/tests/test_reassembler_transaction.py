@@ -184,6 +184,35 @@ def test_sweep_times_out_incomplete_transaction() -> None:
     assert rs.pending_transactions() == 0
 
 
+def test_shared_reassembler_completes_txn_split_across_shards() -> None:
+    """Regression: DSQL CDC distributes one source transaction's records across
+    every open shard. The replicator must assemble them via one process-global
+    TransactionReassembler. If `ConsumerPipeline` ever reintroduces per-shard
+    reassemblers, ~90% of multi-shard transactions silently timeout — this test
+    pins the shared-instance contract."""
+    shared = TransactionReassembler()
+    # Record 1 arrives on logical shard-A worker.
+    assert shared.ingest(_full("tx-split", "r1", total=2, ts_ns=100)) is None
+    # Record 2 arrives on logical shard-B worker (same shared instance).
+    out = shared.ingest(_full("tx-split", "r2", total=2, ts_ns=200))
+    assert isinstance(out, CompletedTransaction)
+    assert out.total_records == 2
+    assert {_record_id_of(r) for r in out.records} == {"r1", "r2"}
+    assert shared.pending_transactions() == 0
+
+
+def test_per_shard_reassemblers_lose_cross_shard_txn_regression_doc() -> None:
+    """Document the failure mode the shared-instance design prevents: two
+    independent reassemblers (one per shard) can never complete a transaction
+    whose records are split across them, even after the full set has arrived."""
+    shard_a = TransactionReassembler()
+    shard_b = TransactionReassembler()
+    assert shard_a.ingest(_full("tx-x", "r1", total=2, ts_ns=100)) is None
+    assert shard_b.ingest(_full("tx-x", "r2", total=2, ts_ns=200)) is None
+    assert shard_a.pending_transactions() == 1
+    assert shard_b.pending_transactions() == 1
+
+
 def test_sweep_prevents_resurrection_of_timed_out_txn() -> None:
     """After a timeout, a late-arriving record for that txn must not create a new buffer."""
     rs = TransactionReassembler(timeout_seconds=1.0)

@@ -76,23 +76,54 @@ def _probe_sns(cfg: Config) -> ProbeResult:
         return ProbeResult("sns", False, f"topic probe failed: {exc}")
 
 
+def _check_liveness_file(path: Path) -> tuple[bool, str]:
+    """Return (ok, detail) for a single liveness file. Missing or stale → not ok."""
+    if not path.exists():
+        return False, "heartbeat file missing"
+    try:
+        age = time.time() - path.stat().st_mtime
+    except OSError as exc:
+        return False, f"stat failed: {exc}"
+    if age > LIVENESS_MAX_AGE_SEC:
+        return False, f"heartbeat stale: {age:.1f}s > {LIVENESS_MAX_AGE_SEC}s"
+    return True, f"heartbeat {age:.1f}s old"
+
+
 def _probe_liveness(_: Config) -> ProbeResult:
     """Verify the running pipeline's metrics loop has touched the heartbeat file recently.
 
-    If the file is missing (e.g. first 10s after container start) we treat it as
+    Multi-process shape (`REPLICATOR_PROCESSES > 1`): each child writes
+    `/tmp/dsql-replicator-liveness-{i}`; healthz passes only if ALL children's
+    files are present and fresh. One slow or crashed child fails the probe —
+    this is the signal we want Fargate's circuit breaker to see.
+
+    If a file is missing (e.g. first 10s after container start) we treat it as
     not-yet-ready and return False — Fargate's HEALTHCHECK `start_period` grace
     window absorbs that until the pipeline writes its first heartbeat.
     """
-    p = Path(LIVENESS_PATH)
-    if not p.exists():
-        return ProbeResult("liveness", False, "heartbeat file missing")
     try:
-        age = time.time() - p.stat().st_mtime
-    except OSError as exc:
-        return ProbeResult("liveness", False, f"stat failed: {exc}")
-    if age > LIVENESS_MAX_AGE_SEC:
-        return ProbeResult("liveness", False, f"heartbeat stale: {age:.1f}s > {LIVENESS_MAX_AGE_SEC}s")
-    return ProbeResult("liveness", True, f"heartbeat {age:.1f}s old")
+        n = int(os.environ.get("REPLICATOR_PROCESSES", "1"))
+    except ValueError:
+        n = 1
+    if n <= 1:
+        ok, detail = _check_liveness_file(Path(LIVENESS_PATH))
+        return ProbeResult("liveness", ok, detail)
+
+    failures: list[str] = []
+    freshest = -1.0
+    for i in range(n):
+        p = Path(f"{LIVENESS_PATH}-{i}")
+        ok, detail = _check_liveness_file(p)
+        if not ok:
+            failures.append(f"p{i}: {detail}")
+        else:
+            # detail is like "heartbeat 2.1s old" — track oldest fresh for ok-detail.
+            with __import__("contextlib").suppress(ValueError, IndexError):
+                age = float(detail.split()[1].rstrip("s"))
+                freshest = max(freshest, age)
+    if failures:
+        return ProbeResult("liveness", False, f"{len(failures)}/{n} children: " + "; ".join(failures))
+    return ProbeResult("liveness", True, f"all {n} children fresh (oldest {freshest:.1f}s)")
 
 
 async def run_healthz(cfg: Config) -> list[ProbeResult]:

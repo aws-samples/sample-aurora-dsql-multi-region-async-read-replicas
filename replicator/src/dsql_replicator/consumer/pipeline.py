@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import signal
 import time
 from datetime import datetime
@@ -94,6 +95,13 @@ class ConsumerPipeline:
         )
         self._dlq = DlqWriter(cfg, target_endpoint)
         self._fence_poll_interval_s = cfg.fence_poll_interval_ms / 1000.0
+        # DSQL CDC distributes a single source transaction's records across every open
+        # shard. Reassembly must be process-global, not per-shard, or ~90% of txns on a
+        # multi-shard stream are dropped as `txn.timeout` with `buffered < expected`.
+        self._txn = TransactionReassembler(
+            timeout_seconds=cfg.txn_assembly_timeout_ms / 1000.0,
+        )
+        self._txn_sweep_interval_s = max(0.25, cfg.txn_assembly_timeout_ms / 1000.0 / 4)
         # Expose stream_name for the multi-stream orchestrator in consumer/__init__.py.
         self.stream_name = stream_name
 
@@ -120,13 +128,23 @@ class ConsumerPipeline:
         self.leases_acquired = 0
         self.leases_lost = 0
         self.checkpoints_flushed = 0
+        self.txn_timeouts = 0
 
         # M5: metrics. Shard-level state updated by the shard worker.
+        # When running under the multi-process supervisor (`PROCESS_ID` set in each
+        # child), tag emissions with that id so dashboard aggregation can Sum or Avg
+        # across processes and alarms can scope to one child when needed.
+        process_id = os.environ.get("PROCESS_ID")
+        default_dims: tuple[tuple[str, str], ...] = (
+            ("TargetCluster", target_endpoint.cluster_identifier or "unknown"),
+        )
+        if process_id is not None:
+            default_dims = (*default_dims, ("ProcessId", process_id))
         self._metrics_interval_s = cfg.metrics_interval_ms / 1000.0
         self._metrics = MetricsEmitter(
             namespace=cfg.metrics_namespace,
             region=cfg.control_region,
-            default_dims=(("TargetCluster", target_endpoint.cluster_identifier or "unknown"),),
+            default_dims=default_dims,
         )
         self._shard_state: dict[str, dict[str, Any]] = {}
         self._prev_counters: dict[str, int] = {}
@@ -155,6 +173,7 @@ class ConsumerPipeline:
                 runner_task = asyncio.create_task(self._apply_runner(), name="apply-runner")
                 fence_task = asyncio.create_task(self._fence_poller(), name="fence-poller")
                 metrics_task = asyncio.create_task(self._metrics_loop(), name="metrics-loop")
+                sweep_task = asyncio.create_task(self._txn_sweeper(), name="txn-sweeper")
                 try:
                     await self._stop.wait()
                 finally:
@@ -163,8 +182,14 @@ class ConsumerPipeline:
                     runner_task.cancel()
                     fence_task.cancel()
                     metrics_task.cancel()
+                    sweep_task.cancel()
                     await asyncio.gather(
-                        *worker_tasks, runner_task, fence_task, metrics_task, return_exceptions=True
+                        *worker_tasks,
+                        runner_task,
+                        fence_task,
+                        metrics_task,
+                        sweep_task,
+                        return_exceptions=True,
                     )
         finally:
             await self._applier.close()
@@ -185,6 +210,7 @@ class ConsumerPipeline:
                 leases_acquired=self.leases_acquired,
                 leases_lost=self.leases_lost,
                 checkpoints_flushed=self.checkpoints_flushed,
+                txn_timeouts=self.txn_timeouts,
             )
 
     def stop(self) -> None:
@@ -234,7 +260,7 @@ class ConsumerPipeline:
 
         self._ordering.register_shard(shard_key)
         fragment = FragmentReassembler(timeout_seconds=self._cfg.fragment_timeout_ms / 1000.0)
-        txn = TransactionReassembler(timeout_seconds=self._cfg.txn_assembly_timeout_ms / 1000.0)
+        # NB: transaction reassembly is process-global on `self._txn` — see __init__ for the why.
         latest_ts_ns = 0
         latest_sequence_number: str | None = None
         last_checkpoint_flush_mono = time.monotonic()
@@ -283,7 +309,7 @@ class ConsumerPipeline:
                 if ready is None:
                     continue
 
-                completed = txn.ingest(ready)
+                completed = self._txn.ingest(ready)
                 if completed is None:
                     # Still waiting on other records in this txn — but we can tighten the
                     # per-shard watermark from the records we have observed so far.
@@ -307,17 +333,10 @@ class ConsumerPipeline:
             # Even on empty batches, keep the watermark fresh so idle shards can advance.
             self._ordering.update_shard(shard_key, latest_ts_ns=latest_ts_ns, millis_behind_latest=mbl)
 
-            # Sweep timeouts (fragment reassembly, incomplete txns). M3 routes these to DLQ.
+            # Sweep per-shard fragment timeouts. Transaction-level sweep is global —
+            # see `_txn_sweeper` — because the reassembler is shared across shards.
             for ft in fragment.sweep():
                 log.warning("fragment.timeout", shard=shard_id, chunk_id=ft.chunk_id)
-            for tt in txn.sweep():
-                log.warning(
-                    "txn.timeout",
-                    shard=shard_id,
-                    tx_id=tt.tx_id,
-                    buffered=tt.buffered,
-                    expected=tt.expected,
-                )
 
             # M4: periodic (best-effort) checkpoint flush. Replay-on-restart is
             # protected by the `__replicator_applied` stamp table.
@@ -347,26 +366,58 @@ class ConsumerPipeline:
     # ---- apply runner ---------------------------------------------------
 
     async def _apply_runner(self) -> None:
-        """Dispatch ready txns as concurrent tasks (bounded by `applier_workers`).
+        """Accumulate ready txns into size-or-time batches, dispatch as concurrent
+        batch-apply tasks (bounded by `applier_workers`).
 
-        The applier's stripe locks (M6.0) preserve per-key order inside; concurrency
-        here is what actually fills those stripes. On any permanent apply failure we
-        open a DLQ fence and halt further dispatch until the operator resolves. In-
-        flight tasks are awaited before honoring the stop event so they don't lose
-        their applied rows.
+        Micro-batching (A) packs up to `batch_max_txns` source txns per cross-region
+        BEGIN..COMMIT; partial batches flush after `batch_max_wait_ms`. Per-key
+        ordering is preserved: within a batch, DMLs run in ts_ns order inside one
+        SQL txn; across batches, stripe locks serialize touching the same key.
+
+        On a non-retryable batch failure, the task falls back to single-txn apply
+        per `self._apply_batch_task`, so fence/DLQ granularity stays per-source-txn.
         """
         log.info(
             "apply_runner.start",
             stripes=self._cfg.applier_stripes,
             workers=self._cfg.applier_workers,
+            batch_max_txns=self._cfg.batch_max_txns,
+            batch_max_wait_ms=self._cfg.batch_max_wait_ms,
         )
         sem = asyncio.Semaphore(self._cfg.applier_workers)
         in_flight: set[asyncio.Task[None]] = set()
         fenced = asyncio.Event()
+        pending: list[Any] = []  # list[CompletedTransaction]
+        pending_first_mono = 0.0
+        batch_max = max(1, self._cfg.batch_max_txns)
+        batch_wait_s = max(0.0, self._cfg.batch_max_wait_ms / 1000.0)
+
+        async def _dispatch() -> None:
+            nonlocal pending, pending_first_mono
+            if not pending:
+                return
+            batch = pending
+            pending = []
+            pending_first_mono = 0.0
+            await sem.acquire()
+            task = asyncio.create_task(
+                self._apply_batch_task(batch, sem, fenced),
+                name=f"apply_batch:n={len(batch)}",
+            )
+            in_flight.add(task)
+            task.add_done_callback(in_flight.discard)
+
         while not self._stop.is_set():
-            # If a fence has been opened, drain in-flight and sleep. The fence poller
-            # will clear ordering buffer's fence when the operator resolves.
+            # If a fence has been opened, drain in-flight (and any pending batch) and
+            # wait for the fence poller to clear it.
             if fenced.is_set():
+                if pending:
+                    # Re-ingest so the ordering buffer can regate under the fence.
+                    for t in pending:
+                        with contextlib.suppress(BackpressureError):
+                            self._ordering.ingest(t)
+                    pending = []
+                    pending_first_mono = 0.0
                 if in_flight:
                     await asyncio.wait(in_flight, return_when=asyncio.ALL_COMPLETED)
                     in_flight.clear()
@@ -374,26 +425,109 @@ class ConsumerPipeline:
                 if self._ordering.fence_ts_ns is None:
                     fenced.clear()
                 continue
+
             ready = self._ordering.ready()
-            if not ready:
-                await asyncio.sleep(0.05)
-                continue
             for completed in ready:
                 if self._stop.is_set() or fenced.is_set():
                     with contextlib.suppress(BackpressureError):
                         self._ordering.ingest(completed)
                     continue
-                await sem.acquire()
-                task = asyncio.create_task(
-                    self._apply_one(completed, sem, fenced),
-                    name=f"apply:{completed.tx_id}",
-                )
-                in_flight.add(task)
-                task.add_done_callback(in_flight.discard)
-        # Clean shutdown: let the last apply tasks finish.
+                if not pending:
+                    pending_first_mono = time.monotonic()
+                pending.append(completed)
+                if len(pending) >= batch_max:
+                    await _dispatch()
+
+            # Time-based flush of a partial batch.
+            if pending and (time.monotonic() - pending_first_mono) >= batch_wait_s:
+                await _dispatch()
+
+            if not ready and not pending:
+                await asyncio.sleep(0.05)
+
+        # Clean shutdown: flush any pending partial batch, then await in-flight.
+        if pending:
+            await _dispatch()
         if in_flight:
             await asyncio.wait(in_flight, return_when=asyncio.ALL_COMPLETED)
         log.info("apply_runner.stop")
+
+    async def _apply_batch_task(
+        self,
+        batch: list[Any],
+        sem: asyncio.Semaphore,
+        fenced: asyncio.Event,
+    ) -> None:
+        """One concurrent batch-apply task.
+
+        Happy path: `Applier.apply_batch(batch)` commits all N source txns in one
+        cross-region transaction. Each result still carries per-txn rows_applied /
+        rows_deduped for metrics.
+
+        Failure path: on `ApplyError`, fall back to per-txn `Applier.apply()`. The
+        bad txn opens a fence at its own ts_ns (unchanged DLQ semantics); earlier
+        txns in the batch still commit; later txns are re-ingested into the
+        ordering buffer so they re-release past the fence.
+        """
+        try:
+            try:
+                results = await self._applier.apply_batch(batch)
+                for completed, result in zip(batch, results, strict=True):
+                    self.transactions_committed += 1
+                    self.rows_replicated += result.rows_applied
+                    self.rows_deduped += result.rows_deduped
+                    log.info(
+                        "apply.ok",
+                        tx_id=completed.tx_id,
+                        rows=result.rows_applied,
+                        dedup=result.rows_deduped,
+                        attempt=result.attempt,
+                        duration_ms=round(result.duration_ms, 1),
+                        stripes=list(result.stripes),
+                        batched=len(batch),
+                    )
+                return
+            except ApplyError as batch_exc:
+                log.warning(
+                    "apply_batch.failed_falling_back",
+                    size=len(batch),
+                    error=str(batch_exc),
+                )
+            # Per-txn fallback. One commit per txn so the bad txn gets its own fence.
+            for i, completed in enumerate(batch):
+                try:
+                    result = await self._applier.apply(completed)
+                    self.transactions_committed += 1
+                    self.rows_replicated += result.rows_applied
+                    self.rows_deduped += result.rows_deduped
+                    log.info(
+                        "apply.ok",
+                        tx_id=completed.tx_id,
+                        rows=result.rows_applied,
+                        dedup=result.rows_deduped,
+                        attempt=result.attempt,
+                        duration_ms=round(result.duration_ms, 1),
+                        stripes=list(result.stripes),
+                        single_txn_fallback=True,
+                    )
+                except ApplyError as inner:
+                    self.apply_errors += 1
+                    log.error(
+                        "apply.failed",
+                        tx_id=completed.tx_id,
+                        ts_ns=completed.ts_ns,
+                        error=str(inner),
+                    )
+                    fenced.set()
+                    await self._open_fence(completed, inner)
+                    # Hand remaining txns back to the ordering buffer so they
+                    # re-release once the fence closes.
+                    for r in batch[i + 1 :]:
+                        with contextlib.suppress(BackpressureError):
+                            self._ordering.ingest(r)
+                    return
+        finally:
+            sem.release()
 
     async def _apply_one(
         self,
@@ -621,6 +755,7 @@ class ConsumerPipeline:
             "leases_acquired",
             "leases_lost",
             "checkpoints_flushed",
+            "txn_timeouts",
         )
         for name in counter_names:
             cur_val = int(getattr(self, name))
@@ -687,6 +822,35 @@ class ConsumerPipeline:
 
         await self._metrics.put_batch(points)
 
+    # ---- transaction reassembly sweeper ---------------------------------
+
+    async def _txn_sweeper(self) -> None:
+        """Global sweep of the shared TransactionReassembler.
+
+        Shard workers push records into `self._txn` but never sweep it — a per-shard sweep
+        would drop cross-shard transactions prematurely. This single-process task is the
+        only place `txn.timeout` is observed, and increments `self.txn_timeouts` for the
+        `TxnTimeouts` CloudWatch metric so this failure mode is never silent.
+        """
+        log.info("txn_sweeper.start", interval_s=self._txn_sweep_interval_s)
+        while not self._stop.is_set():
+            try:
+                for tt in self._txn.sweep():
+                    self.txn_timeouts += 1
+                    log.warning(
+                        "txn.timeout",
+                        tx_id=tt.tx_id,
+                        buffered=tt.buffered,
+                        expected=tt.expected,
+                    )
+            except Exception as exc:
+                log.warning("txn_sweeper.error", error=str(exc))
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self._txn_sweep_interval_s)
+            except TimeoutError:
+                continue
+        log.info("txn_sweeper.stop")
+
     # ---- fence poller ---------------------------------------------------
 
     async def _fence_poller(self) -> None:
@@ -739,7 +903,16 @@ def _camel(snake: str) -> str:
     return "".join(part.capitalize() for part in snake.split("_"))
 
 
-_LIVENESS_PATH = "/tmp/dsql-replicator-liveness"
+def _liveness_path() -> str:
+    """Per-process liveness file when running under the multi-process supervisor
+    (`PROCESS_ID` is set in each child), otherwise the single-process path.
+    `health._probe_liveness` reads `REPLICATOR_PROCESSES` and checks each file."""
+    import os as _os
+
+    pid = _os.environ.get("PROCESS_ID")
+    if pid is not None:
+        return f"/tmp/dsql-replicator-liveness-{pid}"
+    return "/tmp/dsql-replicator-liveness"
 
 
 def _touch_liveness() -> None:
@@ -750,4 +923,4 @@ def _touch_liveness() -> None:
     from pathlib import Path
 
     with contextlib.suppress(OSError):
-        Path(_LIVENESS_PATH).touch(exist_ok=True)
+        Path(_liveness_path()).touch(exist_ok=True)

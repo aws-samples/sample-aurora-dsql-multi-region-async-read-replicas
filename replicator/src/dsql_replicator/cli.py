@@ -31,9 +31,21 @@ def migrate_cmd() -> None:
 
 @main.command("consume")
 def consume_cmd() -> None:
-    """Run the consumer / applier pipeline (M1+)."""
+    """Run the consumer / applier pipeline.
+
+    If `REPLICATOR_PROCESSES > 1`, this command becomes a thin supervisor over N
+    child consumer processes (one asyncio loop each) to escape the Python GIL
+    ceiling. Lease arbitration across children is handled by the existing
+    __replicator_shard_leases table — no coordination code required.
+    """
     cfg = _load_config()
     try:
+        if cfg.replicator_processes > 1:
+            # Imported lazily so single-process runs don't pay the cost.
+            from .consumer.supervisor import run_supervised
+
+            run_supervised(cfg.replicator_processes)  # calls sys.exit internally
+            return
         asyncio.run(consumer.run(cfg))
     except ReplicatorError as exc:
         click.echo(f"error: {exc}", err=True)
