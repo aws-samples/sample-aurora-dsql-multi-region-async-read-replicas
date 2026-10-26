@@ -259,9 +259,12 @@ class DsqlReplicatorStack(cdk.Stack):
                 # workers queue on asyncio stripe locks and CPU stays ~2 %. See
                 # 2026-10-26 stripe-contention finding in docs/DESIGN.md.
                 "APPLIER_STRIPES": "8192",
-                # Micro-batching (A): 16 source txns per cross-region commit, flush
-                # partial batches after 50 ms so steady-state latency stays bounded.
-                "BATCH_MAX_TXNS": "16",
+                # Micro-batching (A): 2 source txns per cross-region commit, flush
+                # partial batches after 50 ms. Larger values (16) measured 2026-10-26
+                # produced ~50 stripes/batch which near-fully serialized on stripe
+                # locks and collapsed applier throughput to ~11 TPS. BATCH=2 keeps
+                # stripes/batch at ~7, which plays well with APPLIER_STRIPES=8192.
+                "BATCH_MAX_TXNS": "2",
                 "BATCH_MAX_WAIT_MS": "50",
             },
             health_check=ecs.HealthCheck(
