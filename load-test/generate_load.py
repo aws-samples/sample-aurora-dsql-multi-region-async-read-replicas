@@ -67,10 +67,13 @@ class TokenCache:
 
     def get(self) -> str:
         if self._token is None or time.monotonic() - self._issued_at > TOKEN_REFRESH_SEC:
-            # Recreate the boto3 client each refresh so a fresh Session re-reads
-            # ~/.aws/credentials — otherwise long-running loads outlive their IAM
-            # session TTL and DSQL rejects every connection as "access denied".
-            client = boto3.client("dsql", region_name=self.region, endpoint_url=self.endpoint_url)
+            # Build a FRESH boto3 Session each refresh so a long-running load gen
+            # survives `ada credentials update` rotations in ~/.aws/credentials.
+            # The default boto3 Session is a module-level singleton that caches
+            # creds at first use — a `boto3.client(...)` alone picks the stale
+            # singleton. Only a new `Session()` re-reads the credentials file.
+            session = boto3.session.Session()
+            client = session.client("dsql", region_name=self.region, endpoint_url=self.endpoint_url)
             self._token = client.generate_db_connect_admin_auth_token(
                 Hostname=self.host, Region=self.region
             )
