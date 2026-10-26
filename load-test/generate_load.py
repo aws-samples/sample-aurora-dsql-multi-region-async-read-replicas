@@ -100,11 +100,20 @@ def gen_payload() -> str:
     return "x" * n
 
 
-def gen_dmls(recent_ids: Deque[uuid.UUID], table: str) -> list[tuple[str, tuple]]:
-    """Build 2-5 DMLs for a single transaction. Returns (sql, params) tuples."""
+def gen_dmls(
+    recent_ids_per_table: dict[str, Deque[uuid.UUID]], tables: list[str]
+) -> list[tuple[str, tuple]]:
+    """Build 2-5 DMLs for a single transaction, spread across the given tables.
+
+    Each DML picks a table at random (uniform). This produces mixed-table
+    transactions when `tables` has >1 entry, which exercises cross-table CDC
+    reassembly on the replicator side. Each table has its own recent-ids deque
+    so UPDATE/DELETE targets a row from the same table as the SQL."""
     n = random.randint(2, 5)
     stmts: list[tuple[str, tuple]] = []
     for _ in range(n):
+        table = random.choice(tables)
+        recent_ids = recent_ids_per_table[table]
         kind = random.choices(["insert", "update", "delete"], weights=[0.6, 0.3, 0.1])[0]
         if kind == "insert" or not recent_ids:
             new_id = uuid.uuid4()
@@ -143,12 +152,14 @@ async def worker(
     minutes: dict[int, MinuteBucket],
     minutes_lock: asyncio.Lock,
     started_at: float,
-    table: str,
+    tables: list[str],
     start_delay_sec: float = 0.0,
 ) -> None:
     if start_delay_sec > 0:
         await asyncio.sleep(start_delay_sec)
-    recent_ids: Deque[uuid.UUID] = deque(maxlen=10_000)
+    recent_ids_per_table: dict[str, Deque[uuid.UUID]] = {
+        t: deque(maxlen=10_000) for t in tables
+    }
     conn: psycopg.AsyncConnection | None = None
     interval = 1.0 / target_rate_per_sec
     next_slot = time.monotonic()
@@ -169,7 +180,7 @@ async def worker(
                 await asyncio.sleep(1.0)
                 continue
 
-        stmts = gen_dmls(recent_ids, table)
+        stmts = gen_dmls(recent_ids_per_table, tables)
         t0 = time.monotonic()
         try:
             async with conn.transaction():
@@ -245,13 +256,21 @@ async def main_async(args: argparse.Namespace) -> None:
     minutes: dict[int, MinuteBucket] = {}
     minutes_lock = asyncio.Lock()
 
+    # --tables (new, comma-separated) wins over --table (legacy single).
+    if getattr(args, "tables", None):
+        tables = [t.strip() for t in args.tables.split(",") if t.strip()]
+    else:
+        tables = [args.table]
+    if not tables:
+        raise SystemExit("no tables configured; use --table or --tables")
+
     started_at = time.monotonic()
     stop_at = started_at + args.duration_sec
     rate_per_worker = (args.tpm / 60.0) / args.workers
 
     print(
         f"[launch] workers={args.workers} tpm={args.tpm} duration_sec={args.duration_sec}"
-        f"  rate_per_worker={rate_per_worker:.3f} txn/s",
+        f"  rate_per_worker={rate_per_worker:.3f} txn/s  tables={tables}",
         flush=True,
     )
 
@@ -260,7 +279,7 @@ async def main_async(args: argparse.Namespace) -> None:
         asyncio.create_task(
             worker(
                 i, args.cluster_host, token_cache, rate_per_worker, stop_at, stats_list[i],
-                minutes, minutes_lock, started_at, args.table,
+                minutes, minutes_lock, started_at, tables,
                 start_delay_sec=(ramp_sec * i / max(1, args.workers - 1)) if ramp_sec > 0 else 0.0,
             )
         )
@@ -346,7 +365,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--duration-sec", type=int, default=900)
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--ramp-sec", type=float, default=0.0, help="stagger worker starts linearly over this window")
-    p.add_argument("--table", default="load_test", help="target table name for DML (must exist on source + target)")
+    p.add_argument("--table", default="load_test", help="single-table DML target (must exist on source + target)")
+    p.add_argument("--tables", default=None, help="comma-separated table list; wins over --table. Each txn's DMLs spread across these.")
     p.add_argument("--output", default=None)
     return p.parse_args()
 
