@@ -124,7 +124,7 @@ Cross-region, zero apply errors, no fences opened.
 | **2026-10-26 after stripe fix** | **128 / 8192 / 8** | **~700** | **~2,400** |
 
 Source side load-tested at 533 TPS for 7 min against the dsql cluster
-`kbud4lp76tyvoj5zligoi5otlm.dsql.us-east-1.on.aws` with zero errors, zero
+`<SOURCE_CLUSTER_ID>.dsql.us-east-1.on.aws` with zero errors, zero
 fences, zero credential rotations lost. The credential-rotation fix
 (commit `6286c6f`) was validated across both the 30-min and the 7-min
 runs. Applier TPS (~700) exceeded the source TPS (~533) and drained

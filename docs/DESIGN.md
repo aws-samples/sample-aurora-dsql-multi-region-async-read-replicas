@@ -395,8 +395,8 @@ priori preference. They are the parts of the design most worth challenging.
 ### Measurement outcome
 
 Source: 300 async workers, 30-min duration, 5-min ramp, source cluster
-`kbud4lp76tyvoj5zligoi5otlm` → Kinesis `my-cdc-stream` (4 shards). Target:
-`djue5mkorsu6v67bw4jise6qna` (us-east-2).
+`<SOURCE_CLUSTER_ID>` → Kinesis `my-cdc-stream` (4 shards). Target:
+`<TARGET_CLUSTER_ID>` (us-east-2).
 
 - **Source**: 952,734 txns committed in 30 min, zero failures, effective
   ~529 TPS; p50/p95/p99 at 459 / 889 / 1,226 ms.

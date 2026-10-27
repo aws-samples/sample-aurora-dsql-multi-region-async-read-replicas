@@ -30,6 +30,9 @@ node_modules/
 .vscode/
 .idea/
 
+# Claude Code (local agent settings; not part of the sample)
+.claude/
+
 # Local artifacts
 build/
 dist/
