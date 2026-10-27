@@ -246,8 +246,11 @@ class Applier:
         if self._bootstrapped:
             return
         assert self._schema_conn is not None
+        # DSQL enforces one DDL per transaction; commit after EACH CREATE.
         async with self._schema_conn.cursor() as cur:
             await cur.execute(_APPLIED_TABLE_DDL)
+        await self._schema_conn.commit()
+        async with self._schema_conn.cursor() as cur:
             await cur.execute(_LATE_DISCARDS_TABLE_DDL)
         await self._schema_conn.commit()
         await bootstrap_dlq_tables(self._schema_conn)
