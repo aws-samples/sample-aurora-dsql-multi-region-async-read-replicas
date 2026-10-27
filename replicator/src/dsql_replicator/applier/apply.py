@@ -56,13 +56,24 @@ CursorHook = Callable[[psycopg.AsyncCursor[Any]], Awaitable[None]]
 log = structlog.get_logger("applier")
 
 _APPLIED_TABLE_DDL = """
-CREATE TABLE IF NOT EXISTS __replicator_applied (
-    tx_id      text NOT NULL,
-    record_id  text NOT NULL,
-    applied_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (tx_id, record_id)
+CREATE TABLE IF NOT EXISTS __replicator_applied_v2 (
+    schema_name   text NOT NULL,
+    table_name    text NOT NULL,
+    pk            text NOT NULL,
+    applied_ts_ns bigint NOT NULL,
+    applied_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (schema_name, table_name, pk)
 )
 """
+# Per-key last-writer-wins bookkeeping. DSQL CDC is at-least-once, which means
+# a duplicate redelivery can arrive after we've already applied a different txn
+# on the same key (or an older txn can arrive late from a slow shard). Keeping
+# the latest applied source `ts_ns` per key, and only applying a row when its
+# `ts_ns` strictly exceeds the stored one, gives us idempotent LWW semantics
+# that converge to the source's committed state regardless of delivery order.
+#
+# Replaces the earlier `(tx_id, record_id)` dedup, which blocked duplicate
+# redelivery from fixing a prior out-of-order apply.
 
 
 class ApplyError(ReplicatorError):
@@ -352,7 +363,8 @@ class Applier:
         rows_deduped = 0
         async with conn.transaction(), conn.cursor() as cur:
             for rec in txn.records:
-                stamped = await self._stamp(cur, txn.tx_id, _record_id(rec))
+                schema_name, table_name, pk_text, ts_ns = await self._record_key_tuple(rec)
+                stamped = await self._stamp(cur, schema_name, table_name, pk_text, ts_ns)
                 if not stamped:
                     rows_deduped += 1
                     continue
@@ -443,7 +455,8 @@ class Applier:
                 rows_applied = 0
                 rows_deduped = 0
                 for rec in txn.records:
-                    stamped = await self._stamp(cur, txn.tx_id, _record_id(rec))
+                    schema_name, table_name, pk_text, ts_ns = await self._record_key_tuple(rec)
+                    stamped = await self._stamp(cur, schema_name, table_name, pk_text, ts_ns)
                     if not stamped:
                         rows_deduped += 1
                         continue
@@ -473,12 +486,46 @@ class Applier:
             stripes.add(_stripe_of(key, self._stripe_count))
         return stripes
 
-    async def _stamp(self, cur: psycopg.AsyncCursor[Any], tx_id: str, record_id: str) -> bool:
+    async def _stamp(
+        self,
+        cur: psycopg.AsyncCursor[Any],
+        schema_name: str,
+        table_name: str,
+        pk_text: str,
+        ts_ns: int,
+    ) -> bool:
+        """Per-key last-writer-wins stamp. Returns True iff this record's
+        source `ts_ns` is strictly greater than the one already recorded for
+        this (schema, table, pk) — i.e., the caller should run the row DML.
+
+        The UPSERT runs in the same target transaction as the row DML, so
+        either both the stamp and the row land, or neither does (rollback).
+        """
         await cur.execute(
-            "INSERT INTO __replicator_applied (tx_id, record_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
-            (tx_id, record_id),
+            """
+            INSERT INTO __replicator_applied_v2
+                (schema_name, table_name, pk, applied_ts_ns)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (schema_name, table_name, pk) DO UPDATE
+                SET applied_ts_ns = EXCLUDED.applied_ts_ns,
+                    applied_at    = now()
+                WHERE __replicator_applied_v2.applied_ts_ns < EXCLUDED.applied_ts_ns
+            """,
+            (schema_name, table_name, pk_text, ts_ns),
         )
         return cur.rowcount == 1
+
+    async def _record_key_tuple(self, rec: ReadyRecord) -> tuple[str, str, str, int]:
+        """Return the LWW stamp key for a record: (schema, table, pk_json, ts_ns)."""
+        assert self._schema is not None
+        source = _source_of(rec)
+        meta = await self._schema.get(source.schema_name, source.table)
+        payload = _after_of(rec) or _before_of(rec) or {}
+        pk_values = [str(payload.get(pk, "")) for pk in meta.pk_columns]
+        import json
+
+        pk_text = json.dumps(pk_values, separators=(",", ":"))
+        return source.schema_name, source.table, pk_text, int(source.ts_ns)
 
     async def _apply_record(self, cur: psycopg.AsyncCursor[Any], rec: ReadyRecord) -> None:
         assert self._schema is not None

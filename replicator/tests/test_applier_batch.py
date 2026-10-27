@@ -174,6 +174,40 @@ async def test_apply_batch_once_writes_each_txn_in_single_transaction(
 
 
 @pytest.mark.asyncio
+async def test_stamp_lww_shape(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_stamp` must UPSERT into the per-key v2 bookkeeping table and gate on
+    `applied_ts_ns < EXCLUDED.applied_ts_ns`. This is the invariant that lets
+    us absorb at-least-once CDC redelivery and late-arriving older txns."""
+    applier = _FakeStripeHashApplier()
+    exec_calls: list[tuple[str, Any]] = []
+    cur = _FakeCursor(rowcount=1, calls=exec_calls)
+    ok = await applier._stamp(cur, "public", "orders", '["42"]', 1_000_000)
+    assert ok is True
+    assert len(exec_calls) == 1
+    sql_text = exec_calls[0][0]
+    # Must target the new per-key table.
+    assert "__replicator_applied_v2" in sql_text
+    # Must be an UPSERT with the LWW gate.
+    assert "ON CONFLICT" in sql_text
+    assert "applied_ts_ns" in sql_text
+    # The gate must compare existing to EXCLUDED strictly (older wins stays).
+    assert "< EXCLUDED.applied_ts_ns" in sql_text
+    # Params must include schema, table, pk, ts_ns.
+    params = exec_calls[0][1]
+    assert params == ("public", "orders", '["42"]', 1_000_000)
+
+
+@pytest.mark.asyncio
+async def test_stamp_lww_rejects_stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When the UPSERT's WHERE clause rejects (older or equal ts_ns), the DB
+    reports rowcount=0 and `_stamp` returns False — the caller must skip DML."""
+    applier = _FakeStripeHashApplier()
+    cur = _FakeCursor(rowcount=0, calls=[])
+    ok = await applier._stamp(cur, "public", "orders", '["42"]', 500)
+    assert ok is False
+
+
+@pytest.mark.asyncio
 async def test_apply_batch_once_counts_dedupes_per_txn(monkeypatch: pytest.MonkeyPatch) -> None:
     """When the stamp INSERT reports rowcount=0 (already applied), the row is
     counted as deduped, not applied — and the counter is scoped per txn."""
