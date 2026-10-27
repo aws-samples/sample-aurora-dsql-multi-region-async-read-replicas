@@ -72,6 +72,7 @@ The replicator's own bookkeeping lives inside the target DSQL cluster itself, al
 | Table | Purpose |
 |---|---|
 | **Applied-stamps** | One row per `(schema, table, primary key)` that was applied, carrying the latest source `ts_ns` seen for that key. Written as a conditional UPSERT inside the same target transaction as the row apply — the DML only runs when the incoming `ts_ns` is strictly greater than what is stored. This gives us per-key last-writer-wins and absorbs at-least-once CDC redelivery with zero application-level logic. |
+| **Late-discards (audit)** | One row per record whose source `ts_ns` lost the LWW race (stored `ts_ns > incoming ts_ns`). Captures `tx_id`, `record_id`, key, both timestamps, op, and the full `before`/`after` JSON. Written in the same target transaction as the LWW stamp decision — a late discard is NEVER lost silently. Distinct from the DLQ fence/payload tables (which are for apply *failures*, not for correct-but-rejected writes). |
 | **DLQ fence** | When an apply fails permanently, one row records which transaction is blocking forward progress. The applier reads this to decide when to resume. |
 | **DLQ payload** | The full stored transaction body for a fenced transaction, so an operator can inspect and retry without replaying Kinesis. |
 | **Checkpoints** | Per-shard "last-processed" sequence number, so a restart resumes where the previous process left off. |

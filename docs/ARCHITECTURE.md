@@ -206,6 +206,7 @@ All state in target DSQL.
 
 ```
 __replicator_applied_v2       (schema,table,pk)        — per-key LWW stamp carrying latest applied_ts_ns (post-2026-10-26)
+__replicator_late_discards    (tx_id, record_id)       — audit of rows the LWW guard rejected (older t_commit arrived late)
 __replicator_dlq_fences       (tx_id)                  — fence rows, status OPEN/CLOSED/SKIPPED (M3)
 __replicator_dlq_payload      (tx_id)                  — full CompletedTransaction JSONB (M3)
 __replicator_checkpoints      (stream, shard)          — Kinesis seq + ts_ns per shard (M4)

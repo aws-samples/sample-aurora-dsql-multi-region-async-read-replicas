@@ -616,3 +616,40 @@ The old `__replicator_applied(tx_id, record_id)` table is left in place
 (unused). It can be dropped manually after a confirmed clean run on the
 new build. No automatic migration is attempted — the two tables answer
 different questions, and the new one starts empty.
+
+### Late-discard observability (shipped alongside the LWW change)
+
+A late older `t_commit` on a key we've already written isn't an error — it's
+the LWW invariant doing its job. But a silent drop with no audit trail hides
+information operators sometimes need: *was this record ever seen?*, *how far
+behind was the slow shard?*, *which business entity lost a write?*.
+
+The 2026-10-26 LWW bundle therefore also added:
+
+1. **`__replicator_late_discards(tx_id, record_id, schema_name, table_name,
+   pk, incoming_ts_ns, stored_ts_ns, op, payload, discarded_at)`** —
+   written inside the batch's open target transaction so the audit row is
+   atomic with the LWW stamp decision. `ON CONFLICT (tx_id, record_id) DO
+   NOTHING` makes the write idempotent across retries. `payload` is the
+   full `{before, after}` JSON so operators can reconstruct what the
+   losing write would have done.
+
+2. **Structured log line `apply.late_discard`** on every late-discard
+   event, with `tx_id`, `record_id`, key, incoming/stored ts_ns, delta_ms,
+   op. One grep in CloudWatch Logs Insights surfaces every losing write.
+
+3. **New CloudWatch metric `RowsLateDiscarded`** on the dedicated counter
+   `ConsumerPipeline.rows_late_discarded`. Separate from `RowsDeduped`
+   (crash-replay) and from `ApplyErrors` / `FencesOpened` (genuine
+   failures). The dashboard's throughput panel shows it as its own series
+   so a spike is immediately visible without being conflated with normal
+   dedup activity.
+
+**Implementation note:** when the LWW stamp's `WHERE` gate rejects the
+UPSERT, `_stamp()` does one extra `SELECT applied_ts_ns FROM
+__replicator_applied_v2 WHERE …` to recover the stored value. This lets
+the caller distinguish `stored_ts > incoming_ts` (late discard, logged
+and persisted) from `stored_ts == incoming_ts` (crash-replay dedup,
+counted but not persisted — the record was already applied under its
+own `tx_id`). The extra SELECT only runs on the non-advance path, so
+happy-path cost is unchanged.

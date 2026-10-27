@@ -172,8 +172,10 @@ assume `resource_prefix=dsql-replicator`; override via CDK context.
 | SNS alarms topic | `dsql-replicator-alarms` (KMS-encrypted) |
 | KMS CMK | customer-managed, rotation enabled, retention policy RETAIN |
 
-The replicator's **state plane** lives in the target DSQL cluster as six
-active tables: `__replicator_applied_v2` (per-key LWW stamp),
+The replicator's **state plane** lives in the target DSQL cluster as
+seven active tables: `__replicator_applied_v2` (per-key LWW stamp),
+`__replicator_late_discards` (audit log of rows the LWW guard rejected
+because an older `t_commit` arrived after a newer one applied),
 `__replicator_dlq_fences`, `__replicator_dlq_payload`,
 `__replicator_checkpoints`, `__replicator_shard_leases`,
 `__replicator_watermark_state`. (The old `__replicator_applied(tx_id,
