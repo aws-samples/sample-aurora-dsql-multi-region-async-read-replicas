@@ -121,6 +121,13 @@ class ConsumerPipeline:
         self.transactions_committed = 0
         self.rows_replicated = 0
         self.rows_deduped = 0
+        # Rows the LWW stamp rejected because an older `t_commit` arrived
+        # after a newer one had already been applied for the same key.
+        # Counted + persisted to `__replicator_late_discards` on the apply
+        # side; emitted as the `RowsLateDiscarded` CloudWatch metric so
+        # dashboards can distinguish this from crash-replay dedup and from
+        # genuine apply failures.
+        self.rows_late_discarded = 0
         self.parse_errors = 0
         self.apply_errors = 0
         self.fences_opened = 0
@@ -476,6 +483,7 @@ class ConsumerPipeline:
                     self.transactions_committed += 1
                     self.rows_replicated += result.rows_applied
                     self.rows_deduped += result.rows_deduped
+                    self.rows_late_discarded += result.rows_late_discarded
                     log.info(
                         "apply.ok",
                         tx_id=completed.tx_id,
@@ -500,6 +508,7 @@ class ConsumerPipeline:
                     self.transactions_committed += 1
                     self.rows_replicated += result.rows_applied
                     self.rows_deduped += result.rows_deduped
+                    self.rows_late_discarded += result.rows_late_discarded
                     log.info(
                         "apply.ok",
                         tx_id=completed.tx_id,
@@ -541,11 +550,13 @@ class ConsumerPipeline:
             self.transactions_committed += 1
             self.rows_replicated += result.rows_applied
             self.rows_deduped += result.rows_deduped
+            self.rows_late_discarded += result.rows_late_discarded
             log.info(
                 "apply.ok",
                 tx_id=completed.tx_id,
                 rows=result.rows_applied,
                 dedup=result.rows_deduped,
+                late_discarded=result.rows_late_discarded,
                 attempt=result.attempt,
                 duration_ms=round(result.duration_ms, 1),
                 stripes=list(result.stripes),
@@ -748,6 +759,7 @@ class ConsumerPipeline:
             "transactions_committed",
             "rows_replicated",
             "rows_deduped",
+            "rows_late_discarded",
             "parse_errors",
             "apply_errors",
             "fences_opened",

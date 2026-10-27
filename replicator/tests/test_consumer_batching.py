@@ -106,6 +106,7 @@ def _bare_pipeline(batch_max_txns: int, batch_max_wait_ms: int) -> ConsumerPipel
     pipe.transactions_committed = 0  # type: ignore[attr-defined]
     pipe.rows_replicated = 0  # type: ignore[attr-defined]
     pipe.rows_deduped = 0  # type: ignore[attr-defined]
+    pipe.rows_late_discarded = 0  # type: ignore[attr-defined]
     pipe.apply_errors = 0  # type: ignore[attr-defined]
     pipe.fences_opened = 0  # type: ignore[attr-defined]
     # _open_fence calls self._dlq.open_fence + self._ordering.set_fence; stub it.

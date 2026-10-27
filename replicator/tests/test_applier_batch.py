@@ -115,12 +115,22 @@ async def test_apply_batch_computes_union_of_touched_stripes(monkeypatch: pytest
 
 
 class _FakeCursor:
-    def __init__(self, rowcount: int, calls: list[tuple[str, Any]]) -> None:
+    def __init__(
+        self,
+        rowcount: int,
+        calls: list[tuple[str, Any]],
+        *,
+        fetchone_result: tuple[Any, ...] | None = None,
+    ) -> None:
         self.rowcount = rowcount
         self._calls = calls
+        self._fetchone_result = fetchone_result
 
     async def execute(self, sql: Any, params: Any = None) -> None:
         self._calls.append((str(sql), params))
+
+    async def fetchone(self) -> tuple[Any, ...] | None:
+        return self._fetchone_result
 
     async def __aenter__(self) -> _FakeCursor:
         return self
@@ -167,7 +177,7 @@ async def test_apply_batch_once_writes_each_txn_in_single_transaction(
     results = await applier._apply_batch_once(conn, txns, pre_commit_hook=None)
 
     assert txn_enter[0] == 1, "batch must run inside a single conn.transaction() block"
-    assert results == [(1, 0), (2, 0)]
+    assert results == [(1, 0, 0), (2, 0, 0)]
     stamp_calls = [c for c in exec_calls if "__replicator_applied" in c[0]]
     assert len(stamp_calls) == 3  # tx1:r0, tx2:r0, tx2:r1
     assert apply_record_calls == ["r0", "r0", "r1"]  # three records applied, in order
@@ -181,9 +191,10 @@ async def test_stamp_lww_shape(monkeypatch: pytest.MonkeyPatch) -> None:
     applier = _FakeStripeHashApplier()
     exec_calls: list[tuple[str, Any]] = []
     cur = _FakeCursor(rowcount=1, calls=exec_calls)
-    ok = await applier._stamp(cur, "public", "orders", '["42"]', 1_000_000)
-    assert ok is True
-    assert len(exec_calls) == 1
+    stamped, stored = await applier._stamp(cur, "public", "orders", '["42"]', 1_000_000)
+    assert stamped is True
+    assert stored is None
+    assert len(exec_calls) == 1  # UPSERT only; no SELECT needed on hit
     sql_text = exec_calls[0][0]
     # Must target the new per-key table.
     assert "__replicator_applied_v2" in sql_text
@@ -200,11 +211,35 @@ async def test_stamp_lww_shape(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.asyncio
 async def test_stamp_lww_rejects_stale(monkeypatch: pytest.MonkeyPatch) -> None:
     """When the UPSERT's WHERE clause rejects (older or equal ts_ns), the DB
-    reports rowcount=0 and `_stamp` returns False — the caller must skip DML."""
+    reports rowcount=0 and `_stamp` returns `(False, stored_ts)` so the caller
+    can distinguish late-discard from crash-replay dedup."""
     applier = _FakeStripeHashApplier()
-    cur = _FakeCursor(rowcount=0, calls=[])
-    ok = await applier._stamp(cur, "public", "orders", '["42"]', 500)
-    assert ok is False
+    cur = _FakeCursor(rowcount=0, calls=[], fetchone_result=(1_000_000,))
+    stamped, stored = await applier._stamp(cur, "public", "orders", '["42"]', 500)
+    assert stamped is False
+    assert stored == 1_000_000
+
+
+@pytest.mark.asyncio
+async def test_stamp_reports_late_discard_vs_dedup() -> None:
+    """When the stamp is gated, `_stamp` returns `(False, stored_ts)`. If
+    `stored_ts > incoming_ts` the caller should treat it as a LATE DISCARD;
+    if `stored_ts == incoming_ts` it is a CRASH-REPLAY DEDUP. Pin that the
+    returned `stored` value lets the caller distinguish both cases."""
+    applier = _FakeStripeHashApplier()
+
+    # Case A: stored_ts > incoming -> late discard
+    cur_late = _FakeCursor(rowcount=0, calls=[], fetchone_result=(2_000_000,))
+    stamped, stored = await applier._stamp(cur_late, "public", "orders", '["k"]', 1_000_000)
+    assert stamped is False
+    assert stored is not None
+    assert stored > 1_000_000
+
+    # Case B: stored_ts == incoming -> crash-replay dedup
+    cur_dup = _FakeCursor(rowcount=0, calls=[], fetchone_result=(1_000_000,))
+    stamped, stored = await applier._stamp(cur_dup, "public", "orders", '["k"]', 1_000_000)
+    assert stamped is False
+    assert stored == 1_000_000  # equal, not strictly greater → dedup
 
 
 @pytest.mark.asyncio
@@ -224,4 +259,4 @@ async def test_apply_batch_once_counts_dedupes_per_txn(monkeypatch: pytest.Monke
 
     txns = [_txn("tx1", 100, ["k1"]), _txn("tx2", 200, ["k2", "k3"])]
     results = await applier._apply_batch_once(conn, txns, pre_commit_hook=None)
-    assert results == [(0, 1), (0, 2)]
+    assert results == [(0, 1, 0), (0, 2, 0)]

@@ -75,6 +75,30 @@ CREATE TABLE IF NOT EXISTS __replicator_applied_v2 (
 # Replaces the earlier `(tx_id, record_id)` dedup, which blocked duplicate
 # redelivery from fixing a prior out-of-order apply.
 
+_LATE_DISCARDS_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS __replicator_late_discards (
+    tx_id          text        NOT NULL,
+    record_id      text        NOT NULL,
+    schema_name    text        NOT NULL,
+    table_name     text        NOT NULL,
+    pk             text        NOT NULL,
+    incoming_ts_ns bigint      NOT NULL,
+    stored_ts_ns   bigint      NOT NULL,
+    op             text        NOT NULL,
+    payload        text,
+    discarded_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tx_id, record_id)
+)
+"""
+# Audit log for rows that lost the per-key LWW race. A late-arriving older
+# source txn on a key already applied with a higher `ts_ns` is correctly
+# rejected by `__replicator_applied_v2`'s gated UPSERT — this table captures
+# the full record payload so an operator can inspect what the "losing" write
+# would have done, without conflating it with real apply failures (which
+# still go to `__replicator_dlq_fences` + `__replicator_dlq_payload`).
+# Written in the same target transaction as the stamp lookup, so persistence
+# is atomic with the LWW decision.
+
 
 class ApplyError(ReplicatorError):
     """Permanent failure applying a transaction to the target. Caller should DLQ + fence."""
@@ -99,6 +123,12 @@ class ApplyResult:
     attempt: int
     duration_ms: float
     stripes: tuple[int, ...] = ()
+    # Rows the LWW stamp rejected because an older `t_commit` arrived after a
+    # newer one had already been applied for the same key. These are stored
+    # in `__replicator_late_discards` for audit and counted on a dedicated
+    # `RowsLateDiscarded` metric — distinct from crash-replay dedup and from
+    # genuine apply failures (which still go to the DLQ fence).
+    rows_late_discarded: int = 0
 
 
 # Transient classes that warrant a retry.
@@ -218,6 +248,7 @@ class Applier:
         assert self._schema_conn is not None
         async with self._schema_conn.cursor() as cur:
             await cur.execute(_APPLIED_TABLE_DDL)
+            await cur.execute(_LATE_DISCARDS_TABLE_DDL)
         await self._schema_conn.commit()
         await bootstrap_dlq_tables(self._schema_conn)
         await bootstrap_state_tables(self._schema_conn)
@@ -323,11 +354,14 @@ class Applier:
             conn = await self._borrow_fresh_conn()
             t0 = time.monotonic()
             try:
-                rows_applied, rows_deduped = await self._apply_once(conn, txn, pre_commit_hook)
+                rows_applied, rows_deduped, rows_late_discarded = await self._apply_once(
+                    conn, txn, pre_commit_hook
+                )
                 return ApplyResult(
                     tx_id=txn.tx_id,
                     rows_applied=rows_applied,
                     rows_deduped=rows_deduped,
+                    rows_late_discarded=rows_late_discarded,
                     attempt=attempt,
                     duration_ms=(time.monotonic() - t0) * 1000.0,
                     stripes=stripes,
@@ -356,17 +390,33 @@ class Applier:
         conn: psycopg.AsyncConnection[tuple[object, ...]],
         txn: CompletedTransaction,
         pre_commit_hook: CursorHook | None = None,
-    ) -> tuple[int, int]:
-        """One attempt against a pool-borrowed connection."""
+    ) -> tuple[int, int, int]:
+        """One attempt against a pool-borrowed connection.
+
+        Returns `(rows_applied, rows_deduped, rows_late_discarded)`."""
         assert self._schema is not None
         rows_applied = 0
         rows_deduped = 0
+        rows_late_discarded = 0
         async with conn.transaction(), conn.cursor() as cur:
             for rec in txn.records:
                 schema_name, table_name, pk_text, ts_ns = await self._record_key_tuple(rec)
-                stamped = await self._stamp(cur, schema_name, table_name, pk_text, ts_ns)
+                stamped, stored_ts = await self._stamp(cur, schema_name, table_name, pk_text, ts_ns)
                 if not stamped:
-                    rows_deduped += 1
+                    if stored_ts is not None and stored_ts > ts_ns:
+                        rows_late_discarded += 1
+                        await self._handle_late_discard(
+                            cur,
+                            txn.tx_id,
+                            rec,
+                            schema_name,
+                            table_name,
+                            pk_text,
+                            ts_ns,
+                            stored_ts,
+                        )
+                    else:
+                        rows_deduped += 1
                     continue
                 await self._apply_record(cur, rec)
                 rows_applied += 1
@@ -374,7 +424,7 @@ class Applier:
                     raise InjectedFaultError(f"injected fault after {rows_applied} row(s), before COMMIT")
             if pre_commit_hook is not None:
                 await pre_commit_hook(cur)
-        return rows_applied, rows_deduped
+        return rows_applied, rows_deduped, rows_late_discarded
 
     async def _apply_batch_with_retry(
         self,
@@ -412,11 +462,12 @@ class Applier:
                         tx_id=txn.tx_id,
                         rows_applied=applied,
                         rows_deduped=deduped,
+                        rows_late_discarded=late,
                         attempt=attempt,
                         duration_ms=duration_ms,
                         stripes=stripes,
                     )
-                    for txn, (applied, deduped) in zip(txns, per_txn, strict=True)
+                    for txn, (applied, deduped, late) in zip(txns, per_txn, strict=True)
                 ]
             except _RETRYABLE as exc:
                 last_exc = exc
@@ -446,25 +497,41 @@ class Applier:
         conn: psycopg.AsyncConnection[tuple[object, ...]],
         txns: list[CompletedTransaction],
         pre_commit_hook: CursorHook | None,
-    ) -> list[tuple[int, int]]:
-        """One attempt against a pool-borrowed connection — one BEGIN..COMMIT for all txns."""
+    ) -> list[tuple[int, int, int]]:
+        """One attempt against a pool-borrowed connection — one BEGIN..COMMIT for all txns.
+
+        Returns per-txn `(rows_applied, rows_deduped, rows_late_discarded)` tuples."""
         assert self._schema is not None
-        per_txn: list[tuple[int, int]] = []
+        per_txn: list[tuple[int, int, int]] = []
         async with conn.transaction(), conn.cursor() as cur:
             for txn in txns:
                 rows_applied = 0
                 rows_deduped = 0
+                rows_late_discarded = 0
                 for rec in txn.records:
                     schema_name, table_name, pk_text, ts_ns = await self._record_key_tuple(rec)
-                    stamped = await self._stamp(cur, schema_name, table_name, pk_text, ts_ns)
+                    stamped, stored_ts = await self._stamp(cur, schema_name, table_name, pk_text, ts_ns)
                     if not stamped:
-                        rows_deduped += 1
+                        if stored_ts is not None and stored_ts > ts_ns:
+                            rows_late_discarded += 1
+                            await self._handle_late_discard(
+                                cur,
+                                txn.tx_id,
+                                rec,
+                                schema_name,
+                                table_name,
+                                pk_text,
+                                ts_ns,
+                                stored_ts,
+                            )
+                        else:
+                            rows_deduped += 1
                         continue
                     await self._apply_record(cur, rec)
                     rows_applied += 1
                     if self._fault_after_rows is not None and rows_applied >= self._fault_after_rows:
                         raise InjectedFaultError(f"injected fault after {rows_applied} row(s), before COMMIT")
-                per_txn.append((rows_applied, rows_deduped))
+                per_txn.append((rows_applied, rows_deduped, rows_late_discarded))
             if pre_commit_hook is not None:
                 await pre_commit_hook(cur)
         return per_txn
@@ -493,13 +560,19 @@ class Applier:
         table_name: str,
         pk_text: str,
         ts_ns: int,
-    ) -> bool:
-        """Per-key last-writer-wins stamp. Returns True iff this record's
-        source `ts_ns` is strictly greater than the one already recorded for
-        this (schema, table, pk) — i.e., the caller should run the row DML.
+    ) -> tuple[bool, int | None]:
+        """Per-key last-writer-wins stamp.
 
-        The UPSERT runs in the same target transaction as the row DML, so
-        either both the stamp and the row land, or neither does (rollback).
+        Returns `(stamped_ok, stored_ts_ns_or_None)`:
+        - `(True, None)` — the stamp was advanced; the caller should run the
+          row DML. The target transaction will commit both atomically.
+        - `(False, stored)` — the WHERE gate rejected the UPSERT. `stored` is
+          the `applied_ts_ns` already recorded for this key. The caller can
+          compare `stored` to `ts_ns` to tell "late-arriving older txn"
+          (`stored > ts_ns`) from "crash-replay dedup" (`stored == ts_ns`).
+
+        Both branches stay inside the single target `BEGIN...COMMIT` the
+        batch runs under; no extra transaction boundary is introduced.
         """
         await cur.execute(
             """
@@ -513,7 +586,107 @@ class Applier:
             """,
             (schema_name, table_name, pk_text, ts_ns),
         )
-        return cur.rowcount == 1
+        if cur.rowcount == 1:
+            return True, None
+        # Gated or no-op. Fetch the stored ts_ns so the caller can distinguish
+        # late-discard from crash-replay. One extra round-trip, only on the
+        # (uncommon) non-advance path.
+        await cur.execute(
+            "SELECT applied_ts_ns FROM __replicator_applied_v2 "
+            "WHERE schema_name = %s AND table_name = %s AND pk = %s",
+            (schema_name, table_name, pk_text),
+        )
+        row = await cur.fetchone()
+        stored = int(row[0]) if row else 0
+        return False, stored
+
+    async def _handle_late_discard(
+        self,
+        cur: psycopg.AsyncCursor[Any],
+        tx_id: str,
+        rec: ReadyRecord,
+        schema_name: str,
+        table_name: str,
+        pk_text: str,
+        incoming_ts_ns: int,
+        stored_ts_ns: int,
+    ) -> None:
+        """Log + persist a late-arriving record that the LWW guard rejected.
+
+        Runs in the batch's open target transaction so the audit row is atomic
+        with the stamp decision. One structured `apply.late_discard` log line
+        per row and one row written to `__replicator_late_discards`.
+        """
+        import json as _json
+
+        op = _op_of(rec)
+        payload = {"before": _before_of(rec), "after": _after_of(rec)}
+        payload_text = _json.dumps(payload, default=str, separators=(",", ":"))
+        log.info(
+            "apply.late_discard",
+            tx_id=tx_id,
+            record_id=_record_id(rec),
+            schema=schema_name,
+            table=table_name,
+            pk=pk_text,
+            incoming_ts_ns=incoming_ts_ns,
+            stored_ts_ns=stored_ts_ns,
+            delta_ms=round((stored_ts_ns - incoming_ts_ns) / 1_000_000.0, 1),
+            op=op,
+        )
+        await self._record_late_discard(
+            cur,
+            tx_id=tx_id,
+            record_id=_record_id(rec),
+            schema_name=schema_name,
+            table_name=table_name,
+            pk_text=pk_text,
+            incoming_ts_ns=incoming_ts_ns,
+            stored_ts_ns=stored_ts_ns,
+            op=op,
+            payload_text=payload_text,
+        )
+
+    async def _record_late_discard(
+        self,
+        cur: psycopg.AsyncCursor[Any],
+        *,
+        tx_id: str,
+        record_id: str,
+        schema_name: str,
+        table_name: str,
+        pk_text: str,
+        incoming_ts_ns: int,
+        stored_ts_ns: int,
+        op: str,
+        payload_text: str,
+    ) -> None:
+        """Persist the full losing record to `__replicator_late_discards`.
+
+        Writes inside the batch's open target transaction, so persistence is
+        atomic with the LWW decision. ON CONFLICT DO NOTHING makes the write
+        idempotent on retries (we only record the first observed loss).
+        """
+        await cur.execute(
+            """
+            INSERT INTO __replicator_late_discards
+                (tx_id, record_id, schema_name, table_name, pk,
+                 incoming_ts_ns, stored_ts_ns, op, payload)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (tx_id, record_id) DO NOTHING
+            """,
+            (
+                tx_id,
+                record_id,
+                schema_name,
+                table_name,
+                pk_text,
+                incoming_ts_ns,
+                stored_ts_ns,
+                op,
+                payload_text,
+            ),
+        )
 
     async def _record_key_tuple(self, rec: ReadyRecord) -> tuple[str, str, str, int]:
         """Return the LWW stamp key for a record: (schema, table, pk_json, ts_ns)."""
