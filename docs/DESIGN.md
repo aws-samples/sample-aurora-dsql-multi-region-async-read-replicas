@@ -123,11 +123,18 @@ key serialize on that key.
   lost. The system now matches the standard CDC contract rather than
   offering a stronger one.
 
-### 3.4 Idempotent apply via per-transaction stamps in the target database
+### 3.4 Idempotent apply via per-key last-writer-wins stamps in the target database
 
-The target cluster holds a stamp table keyed by (transaction id, record id).
-Each row apply and its stamp commit in the same target transaction. Replays
-see the stamp and short-circuit.
+*Note: see the 2026-10-26 LWW section below for the current design. The
+historical description preserved here captures the original single-stamp
+intent; the invariant has since been strengthened to per-key `ts_ns`
+LWW to absorb at-least-once CDC redelivery.*
+
+The target cluster holds a stamp table keyed by `(schema_name, table_name,
+primary_key)` carrying the latest source `ts_ns` applied for that key. Each
+row apply is a conditional UPSERT inside the same target transaction as
+the row DML — the DML runs only when the incoming `ts_ns` strictly exceeds
+the stored one. Replays see the stamp and short-circuit.
 
 - **Why.** Any other scheme creates a window where "crashed between apply
   and remembering we applied" produces a duplicate or a loss. Putting the

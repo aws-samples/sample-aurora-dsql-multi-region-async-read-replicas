@@ -4,11 +4,14 @@ A Python + CDK + Fargate reference implementation that reads Aurora DSQL CDC
 from Kinesis in one region and applies it atomically to a target DSQL cluster
 in another region.
 
-Correctness-first: per-transaction reassembly, per-shard ordering, idempotent
-apply via per-transaction stamps in the target cluster, durable DLQ fence on
-apply failure, fencing-token lease for clean failover. Scales horizontally
-within a single task via per-key stripe-locked parallel apply (256 workers /
-512 stripes at the current shape).
+Correctness-first: per-transaction reassembly, cross-shard global
+transaction reassembly, per-key last-writer-wins via a `(schema, table, pk,
+applied_ts_ns)` stamp table in the target cluster (absorbs at-least-once
+CDC redelivery and late-arriving older txns), durable DLQ fence on apply
+failure, fencing-token lease for clean failover. Scales within a single
+Fargate task via per-key stripe-locked parallel apply + micro-batching
+(128 workers / 8192 stripes / BATCH_MAX_TXNS=2 at the current shape) and
+multi-process children (`REPLICATOR_PROCESSES=2`) for GIL relief.
 
 ---
 

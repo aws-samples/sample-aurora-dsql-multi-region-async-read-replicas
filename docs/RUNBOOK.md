@@ -12,7 +12,7 @@
 - **Reassembles** chunked records, groups by `txId`, orders per-key by `source.ts_ns`.
 - **Writes** to the configured target DSQL cluster with per-key parallel apply.
 - Preserves **per-key ordering** (not global). Two txns on disjoint keys may commit out of global `ts_ns` order; txns on the same key always commit in source order.
-- Idempotent on replay: the `__replicator_applied(tx_id, record_id)` stamp table dedups.
+- Idempotent on replay: the `__replicator_applied_v2(schema, table, pk, applied_ts_ns)` stamp table enforces per-key last-writer-wins by source `ts_ns`.
 - Does **NOT** replicate DDL. New tables must be CREATE'd on both source and target before CDC records touch them.
 - Does **NOT** currently scale beyond `desiredCount=1`. Multi-task scaling needs a future ordering-contract revisit.
 
@@ -153,7 +153,7 @@ Consumer is lagging Kinesis itself, not just the applier. Backpressure (buffer f
 Fargate service `desiredCount=1`. ECS auto-respawns on task failure.
 
 - **Manual restart:** `aws ecs update-service --cluster dsql-replicator-cluster --service dsql-replicator --force-new-deployment --region us-east-1`. Old task drains, new task steals the lease, resumes from checkpoint.
-- **During a crash:** the heartbeat on `__replicator_shard_leases` expires in `LEASE_TTL_SECONDS` (default 30). New task can steal after that. `AFTER_SEQUENCE_NUMBER` iterator resumes from checkpoint; `__replicator_applied` dedups anything replayed.
+- **During a crash:** the heartbeat on `__replicator_shard_leases` expires in `LEASE_TTL_SECONDS` (default 30). New task can steal after that. `AFTER_SEQUENCE_NUMBER` iterator resumes from checkpoint; the per-key `ts_ns` guard on `__replicator_applied_v2` skips any replay (stored `ts_ns` ≥ replayed).
 
 ---
 
@@ -173,20 +173,37 @@ assume `resource_prefix=dsql-replicator`; override via CDK context.
 | KMS CMK | customer-managed, rotation enabled, retention policy RETAIN |
 
 The replicator's **state plane** lives in the target DSQL cluster as six
-tables: `__replicator_applied`, `__replicator_dlq_fences`,
-`__replicator_dlq_payload`, `__replicator_checkpoints`,
-`__replicator_shard_leases`, `__replicator_watermark_state`. Nothing in
+active tables: `__replicator_applied_v2` (per-key LWW stamp),
+`__replicator_dlq_fences`, `__replicator_dlq_payload`,
+`__replicator_checkpoints`, `__replicator_shard_leases`,
+`__replicator_watermark_state`. (The old `__replicator_applied(tx_id,
+record_id)` table may still exist from pre-2026-10-26 deploys; it is no
+longer written and can be dropped at operator discretion.) Nothing in
 DynamoDB; nothing in the control region's data plane.
 
 ---
 
 ## 7. Known limits (not bugs)
 
-- **~8 TPS × ~3 DMLs/txn ≈ 25 DMLs/sec** sustained ceiling with 32 workers. Backlog grows above this. 
+- **~700 TPS sustained** at the current single-task shape (8 vCPU / 16 GB,
+  128 workers, 8192 stripes, BATCH_MAX_TXNS=2, REPLICATOR_PROCESSES=2).
+  Earlier builds (32–256 workers / 64–512 stripes) measured 8–250 TPS.
+  Above 700 TPS, watermark lag grows linearly; the next lever is
+  horizontal task scale with shard partitioning (open TODO).
 - **Hot-key workloads** are capped at ~3 updates/sec per unique PK (cross-region commit latency).
 - **DDL is not replicated.** Operator must CREATE/ALTER on target before source commits touch the new schema.
 - **Cross-key atomicity** in application semantics (e.g. "transfer money across accounts") is NOT preserved — only per-row (per-key) order. This is standard CDC behavior.
-- **`desiredCount` stuck at 1** until the ordering contract is revisited (future work).
+- **`desiredCount` stuck at 1** until the ordering contract is revisited
+  (future work). The multi-process supervisor (`REPLICATOR_PROCESSES`)
+  provides GIL relief within one task; it does not scale across tasks.
+- **Multi-process shard starvation.** With `REPLICATOR_PROCESSES > 1` and
+  shards ≤ child count, the first child to acquire a lease keeps it;
+  siblings idle. The GIL-relief multi-process is intended to deliver is
+  only realized when source shards ≥ children (open TODO #18).
+- **`APPLIER_STRIPES` must dwarf `APPLIER_WORKERS × avg_stripes_per_batch`.**
+  Rule of thumb: `STRIPES ≥ 64 × WORKERS`. The 2026-10-26 incident was
+  128 workers × 512 stripes collapsing to 88 TPS from stripe-lock
+  contention; 8192 stripes restored 700 TPS.
 
 ---
 

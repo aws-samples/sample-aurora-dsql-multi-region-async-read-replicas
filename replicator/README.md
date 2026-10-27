@@ -32,7 +32,7 @@ All config via environment variables; see `src/dsql_replicator/config.py` for th
 ```
 ruff check . && ruff format --check .
 mypy
-pytest -q                                  # 88 unit tests
+pytest -q                                  # 108 unit tests
 ```
 
 ## Deployment

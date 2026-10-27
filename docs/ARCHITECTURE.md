@@ -13,7 +13,7 @@ This document shows the pieces + how they talk.
 ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
 │  Source DSQL     │    │  Kinesis Stream  │    │  Fargate Task    │    │  Target DSQL     │
 │  (OLTP writes)   │───►│  dsql-cdc-stream │───►│  dsql-replicator │───►│  (replicated)    │
-└──────────────────┘    │  (24h retention) │    │  stripes=64 w=32 │    └──────────────────┘
+└──────────────────┘    │  (24h retention) │    │ stripes=8192 w=128│    └──────────────────┘
                         └──────────────────┘    └──────────────────┘             ▲
                                  ▲                       │                       │
                                  │                       ├────── state plane ────┤
@@ -22,7 +22,7 @@ This document shows the pieces + how they talk.
                                  │                       │                       │
                         ┌──────────────────┐             ▼                       ▼
                         │ dsql CDC   │   ┌──────────────────────────────────────┐
-                        │ (IAM role,       │   │ __replicator_applied                 │
+                        │ (IAM role,       │   │ __replicator_applied_v2 (schema,table,pk,ts_ns) │
                         │  partitionKey    │   │ __replicator_dlq_fences              │
                         │  = tx_id)        │   │ __replicator_dlq_payload             │
                         └──────────────────┘   │ __replicator_checkpoints             │
@@ -176,8 +176,8 @@ heartbeat every             (no heartbeat)          lease expires              s
                                                                                → iterator = AFTER_SEQUENCE_NUMBER
 
                                                                                Resume applying from checkpoint
-                                                                               __replicator_applied dedups
-                                                                                 anything replayed
+                                                                               __replicator_applied_v2 per-key
+                                                                                 ts_ns guard skips any replay
 ```
 
 Fencing token: if task A later wakes up and tries to heartbeat with its CACHED lease_token, the UPDATE matches 0 rows (lease_token mismatch) → task A gracefully shuts down the shard worker.
@@ -189,7 +189,7 @@ Fencing token: if task A later wakes up and tries to heartbeat with its CACHED l
 | Invariant | Guarantee |
 |---|---|
 | **I0** — Per-row atomic apply | ONE DSQL transaction per CompletedTransaction. All rows + stamps commit together or none. |
-| **I2** — Exactly-once per record | `__replicator_applied(tx_id, record_id)` stamp table, inserted in the same txn as the row apply. |
+| **I2** — Per-key last-writer-wins (idempotent) | `__replicator_applied_v2(schema, table, pk, applied_ts_ns)` stamp table. UPSERT inside the same target txn as the row apply, gated on `existing.applied_ts_ns < EXCLUDED.applied_ts_ns`. Absorbs at-least-once CDC redelivery and late-arriving older txns; convergence per key is guaranteed. |
 | **I3** — Per-shard watermark | OrderingBuffer tracks each shard's `latest_ts_ns`; `min()` across shards gates release. Idle shards synthetically advance only when `MillisBehindLatest = 0`. |
 | **I5** — Checkpoint resumability | `__replicator_checkpoints` upserted periodically; restart recovers via `AFTER_SEQUENCE_NUMBER` iterator. Replay dedupes via I2. |
 | **I6** — Intra-transaction order | TransactionReassembler emits records sorted by `record_id`. Applier applies in that order inside the one DSQL txn. |
@@ -205,12 +205,13 @@ Reversed vs the original M0 spec:
 All state in target DSQL.
 
 ```
-__replicator_applied          (tx_id, record_id)       — idempotency stamp (M1)
+__replicator_applied_v2       (schema,table,pk)        — per-key LWW stamp carrying latest applied_ts_ns (post-2026-10-26)
 __replicator_dlq_fences       (tx_id)                  — fence rows, status OPEN/CLOSED/SKIPPED (M3)
 __replicator_dlq_payload      (tx_id)                  — full CompletedTransaction JSONB (M3)
 __replicator_checkpoints      (stream, shard)          — Kinesis seq + ts_ns per shard (M4)
 __replicator_shard_leases     (stream, shard)          — single-writer lease + fencing token (M4)
 __replicator_watermark_state  (stream, shard)          — persisted mirror for cold restart (M4; unused yet)
+__replicator_applied          (tx_id, record_id)       — DEPRECATED, left in place from pre-2026-10-26; may be dropped
 ```
 
 Bootstrapped idempotently by `Applier.start()` on every task startup.
@@ -219,7 +220,10 @@ Bootstrapped idempotently by `Applier.start()` on every task startup.
 
 ## 8. What's NOT in this architecture
 
-- **Multi-task scale.** `desiredCount=1` enforced. Reversing requires breaking per-shard ordering too (future).
+- **Multi-task scale.** `desiredCount=1` enforced. The multi-process supervisor
+  (`REPLICATOR_PROCESSES`) runs N children inside ONE task for GIL relief; it
+  does not scale beyond a single Fargate task. Scaling to >1 task requires
+  deterministic shard-task partition (open TODO).
 - **Multi-shard Kinesis.** Single-shard stream by default. Multi-shard producer-side partitioning is a separate design.
 - **Multi-target per process.** One target DSQL cluster per task.
 - **Admin HTTPS API.** CLI only.
