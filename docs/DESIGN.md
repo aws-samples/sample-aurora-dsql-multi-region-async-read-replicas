@@ -496,3 +496,116 @@ had evidence. Instrumentation then confirmed the client-side pathology.
 Lesson for future debugging: **time every stage, don't just time the
 commit** — invisible wait inside asyncio locks is a classic Python
 performance footgun.
+
+---
+
+## 2026-10-26 — Per-key last-writer-wins by source `ts_ns`
+
+### Why the earlier design was insufficient
+
+The previous `__replicator_applied(tx_id, record_id)` dedup correctly
+blocked **exact duplicate** redelivery (same `tx_id`, same `record_id`
+replayed from Kinesis after a crash). It did NOT handle two cases that
+the DSQL CDC team flagged as part of their at-least-once contract:
+
+1. **Duplicate redelivery of a newer txn after we've already applied
+   an older one on the same key.** CDC may deliver `T2` (`ts_ns=200`),
+   then later deliver `T1` (`ts_ns=100`), then re-deliver `T2`. The
+   service team's design assumes the consumer applies the final `T2`
+   so the state converges. Our old dedup would skip the second `T2`
+   as a duplicate `(tx_id, record_id)`, leaving the target stuck at
+   `T1`'s stale value.
+
+2. **Late-arriving older txn on a key we've already written.** If the
+   watermark advances past `ts_ns=200` (e.g. via idle-shard synthetic
+   advance) and `T1@ts_ns=100` arrives afterward, the old design would
+   apply `T1` unconditionally, overwriting `T2`'s newer value.
+
+Both failure modes end in silent per-key divergence.
+
+### What we changed (commit `9cf947e`)
+
+The bookkeeping table is now:
+
+```sql
+CREATE TABLE __replicator_applied_v2 (
+    schema_name   text   NOT NULL,
+    table_name    text   NOT NULL,
+    pk            text   NOT NULL,  -- JSON array of PK columns
+    applied_ts_ns bigint NOT NULL,
+    applied_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (schema_name, table_name, pk)
+);
+```
+
+Per-record application does a **conditional UPSERT** inside the same
+target transaction as the row DML:
+
+```sql
+INSERT INTO __replicator_applied_v2
+    (schema_name, table_name, pk, applied_ts_ns)
+VALUES ($s, $t, $pk, $ts)
+ON CONFLICT (schema_name, table_name, pk) DO UPDATE
+    SET applied_ts_ns = EXCLUDED.applied_ts_ns,
+        applied_at    = now()
+    WHERE __replicator_applied_v2.applied_ts_ns < EXCLUDED.applied_ts_ns;
+```
+
+The applier checks `cur.rowcount`:
+
+- `1` → the stamp advanced; run the row DML.
+- `0` → the stamp was gated by the WHERE clause (incoming `ts_ns` is
+  not strictly greater than stored); skip the DML.
+
+Because the stamp and the DML share the single target `BEGIN...COMMIT`,
+the pair is atomic: either both land or neither does. On rollback,
+nothing persists; on retry, the stamp lookup still shows the correct
+latest `ts_ns`.
+
+### Invariant now guaranteed
+
+> For every replicated key, the value in the target cluster is always
+> the one from the source transaction with the highest `ts_ns` the
+> replicator has ever applied for that key, regardless of delivery
+> order, duplicate redelivery, or late-arriving older transactions.
+
+### What it also fixes beyond CDC redelivery
+
+- **Replay after process crash**: the stamp carries the `ts_ns` of the
+  previously-applied txn; replay sees stored `ts_ns ≥ replayed`, UPSERT
+  is a no-op, DML is skipped. Previously handled by `(tx_id, record_id)`;
+  now handled by the key-level `ts_ns` guard without needing `record_id`
+  to be stable across retries.
+
+- **Watermark-skipped older txn (idle-shard misclassification)**: if the
+  synthetic advance wrongly declares a shard caught up and the pipeline
+  releases a late-arriving `T1@100` after `T2@200` has committed, the
+  stamp for the key already has `ts_ns=200`; `T1`'s UPSERT is gated out;
+  DML never runs. The target stays at `T2`'s value — no silent divergence.
+
+### What this costs
+
+- One extra UPSERT per record (same per-record cost as the prior design;
+  wider row and a WHERE clause but still single-roundtrip inside the
+  batch's target transaction).
+
+- `__replicator_applied_v2` grows with the count of **distinct keys ever
+  touched**, not the count of txns. For most workloads this is strictly
+  smaller than the old table and bounded by the user's row count. A
+  TTL / periodic compaction job can prune ancient entries without
+  affecting correctness as long as the compaction window exceeds the
+  longest expected CDC redelivery delay.
+
+### Opt-in alternative (not shipped yet)
+
+For hot tables where even the bookkeeping lookup is unwanted, users can
+add a `_replicator_t_commit timestamptz` column to the base table and
+the replicator can gate the UPDATE directly on it. More intrusive and
+not yet shipped; path A (bookkeeping) is the default and sufficient.
+
+### Migration
+
+The old `__replicator_applied(tx_id, record_id)` table is left in place
+(unused). It can be dropped manually after a confirmed clean run on the
+new build. No automatic migration is attempted — the two tables answer
+different questions, and the new one starts empty.

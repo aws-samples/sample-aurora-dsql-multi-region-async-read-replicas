@@ -71,7 +71,7 @@ The replicator's own bookkeeping lives inside the target DSQL cluster itself, al
 
 | Table | Purpose |
 |---|---|
-| **Applied-stamps** | One row per (transaction id, record id) that was applied. Written inside the same transaction as the row apply. Blocks duplicates on replay with zero application-level logic. |
+| **Applied-stamps** | One row per `(schema, table, primary key)` that was applied, carrying the latest source `ts_ns` seen for that key. Written as a conditional UPSERT inside the same target transaction as the row apply — the DML only runs when the incoming `ts_ns` is strictly greater than what is stored. This gives us per-key last-writer-wins and absorbs at-least-once CDC redelivery with zero application-level logic. |
 | **DLQ fence** | When an apply fails permanently, one row records which transaction is blocking forward progress. The applier reads this to decide when to resume. |
 | **DLQ payload** | The full stored transaction body for a fenced transaction, so an operator can inspect and retry without replaying Kinesis. |
 | **Checkpoints** | Per-shard "last-processed" sequence number, so a restart resumes where the previous process left off. |
@@ -100,7 +100,7 @@ The operator's resolution is a single CLI command (retry after fixing the target
 
 ### 6.3 Lease-based failover, not stop-the-world
 
-For availability, you can run multiple consumer processes on the same stream. Only one process at a time owns any given shard — enforced by a lease row in the target cluster with a heartbeat and a fencing token. If a process pauses or dies, its lease expires; another process steals it, reads the stored checkpoint, and resumes from the exact sequence number of the last applied record. Any records replayed between the stored checkpoint and the actual last-applied are deduplicated by the applied-stamp table.
+For availability, you can run multiple consumer processes on the same stream. Only one process at a time owns any given shard — enforced by a lease row in the target cluster with a heartbeat and a fencing token. If a process pauses or dies, its lease expires; another process steals it, reads the stored checkpoint, and resumes from the exact sequence number of the last applied record. Records replayed between the stored checkpoint and the actual last-applied are rejected by the per-key `ts_ns` guard on the applied-stamp table — the stored `ts_ns` for the key is already ≥ the replay's `ts_ns`, so the UPSERT's WHERE clause skips the DML.
 
 The fencing token means a process that pauses and later wakes up cannot accidentally resume as the shard owner — its old token no longer matches, and it shuts the shard worker down cleanly.
 
@@ -132,7 +132,7 @@ An operator deploys the whole thing with one command. The runbook covers rollbac
 
 **Backpressure.** The ordering buffer has a hard cap. When the applier can't keep up, incoming decode slows, which stops advancing the Kinesis iterator — turning Kinesis's 24-hour retention into the real overflow buffer.
 
-**Process crash mid-apply.** The target-side transaction either commits everything (rows + applied-stamp) or nothing. On restart, the ordering stage replays any pending records, and the applied-stamp table deduplicates.
+**Process crash mid-apply.** The target-side transaction either commits everything (rows + applied-stamp) or nothing. On restart, the ordering stage replays any pending records, and the per-key `ts_ns` guard on the applied-stamp table rejects the replay (stored `ts_ns` is already ≥ the replayed one).
 
 **Permanent apply failure.** DLQ fence (§6.2). Operator inspects, retries, or skips.
 
