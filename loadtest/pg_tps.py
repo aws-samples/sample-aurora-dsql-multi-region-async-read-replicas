@@ -15,7 +15,7 @@ FK-safety:
   - New rows use ids starting above the seeded range (auto-detected at startup).
 
 Usage:
-  PGPASSWORD=... python3 tps_load.py \
+  PGPASSWORD=... python3 pg_tps.py \
       --host <your-aurora-pg-endpoint> \
       --dbname postgres --user postgres \
       --rate 40 --duration 300

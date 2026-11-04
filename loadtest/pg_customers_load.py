@@ -14,7 +14,7 @@ FK-safety:
     which no order row references. Seeded customers are never touched by DELETE.
 
 Usage:
-  PGPASSWORD=... python3 customers_load.py \
+  PGPASSWORD=... python3 pg_customers_load.py \
       --host <your-aurora-pg-endpoint> \
       --dbname postgres --user postgres \
       --rate 5 --duration 0        # 0 = run until SIGINT/SIGTERM

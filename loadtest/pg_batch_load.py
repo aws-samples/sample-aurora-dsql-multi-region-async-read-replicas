@@ -3,12 +3,12 @@
 Multi-DML transaction change generator for the Aurora PostgreSQL source
 (PG -> Aurora DSQL migration / CDC lag test).
 
-Unlike tps_load.py (1 DML per autocommitted transaction), this generator groups
+Unlike pg_tps.py (1 DML per autocommitted transaction), this generator groups
 a RANDOM number of DML statements -- between --min-dml and --max-dml -- into a
 single explicit BEGIN/COMMIT transaction. --rate controls TRANSACTIONS per
 second, so DML/sec ~= rate * avg(min,max).
 
-FK-safety (same guarantees as tps_load.py):
+FK-safety (same guarantees as pg_tps.py):
   - INSERTs always reference parent ids in the seeded range [1, SEED_ROWS],
     which are never deleted -> inserts can't violate FKs.
   - DELETEs only target leaf tables (order_items, payments, shipments).
@@ -16,7 +16,7 @@ FK-safety (same guarantees as tps_load.py):
   - Each op in a transaction is independently FK-safe, so grouping is safe.
 
 Usage:
-  PGPASSWORD=... python3 batch_load.py \
+  PGPASSWORD=... python3 pg_batch_load.py \
       --host <your-aurora-pg-endpoint> \
       --dbname postgres --user postgres \
       --rate 60 --min-dml 5 --max-dml 15 --duration 3600

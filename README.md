@@ -68,10 +68,17 @@ multi-process children (`REPLICATOR_PROCESSES=2`) for GIL relief.
 │ └── replicator_stack.py ← single-stack: VPC + endpoints + NAT + ECR asset +
 │ KMS + 2 SNS topics + 5 alarms + Fargate task + service
 │
-├── load-test/
-│ └── generate_load.py ← async source-side load generator with ramp-up
-│
-└── dsql-cdc-tail.py ← convenience: tail a CDC stream in your terminal
+└── loadtest/ ← all load / test tooling + README
+  ├── synthetic_publisher.py ← direct Kinesis publisher (full ramp,
+  │ chunked, parse / CRC / LWW injection)
+  ├── _setup_demo_schema.py ← creates `loadtest_events` on the target
+  ├── generate_load.py ← async DSQL-source load generator with ramp-up
+  ├── schemas.sql ← its DDL
+  ├── pg_tps.py ← Postgres-source steady-rate loader
+  ├── pg_batch_load.py ← Postgres-source batched loader
+  ├── pg_customers_load.py ← Postgres-source customer backfill
+  ├── pg_load_1m.sql, pg_append_5m.sql ← Postgres seed + append
+  └── dsql-cdc-tail.py ← tail a CDC stream in your terminal
 ```
 
 ---
