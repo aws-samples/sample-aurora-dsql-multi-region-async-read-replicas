@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -226,6 +227,78 @@ class DlqWriter:
     async def publish_closed(self, tx_id: str) -> None:
         """Side-effect SNS publish after an in-transaction close succeeds."""
         await self._publish_sns(event_type="closed", tx_id=tx_id)
+
+    # ---- ingest-side rejects --------------------------------------------
+
+    async def record_ingest_reject(
+        self,
+        *,
+        stream_name: str,
+        reason: str,
+        shard_id: str | None = None,
+        tx_id: str | None = None,
+        record_id: str | None = None,
+        chunk_id: str | None = None,
+        error_message: str | None = None,
+        raw_bytes: bytes | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> uuid.UUID:
+        """Persist an ingest-side reject to `__replicator_dlq_ingest`.
+
+        Covers parse errors, CRC mismatches, fragment timeouts, and txn-reassembly
+        timeouts — rejects that never reached the applier and therefore do NOT need
+        a fence (there is no commit-order barrier to protect). This is forensics
+        plumbing only; operators query the table to inspect dropped bytes.
+
+        Best-effort: on connection failures we log and return a nil UUID rather
+        than raising, so a transient target-DSQL hiccup can't block the ingest
+        loop. The companion CloudWatch metric for the reason is the primary
+        operator signal; the row is for forensics.
+        """
+        reject_id = uuid.uuid4()
+        details_jsonb = Jsonb(details) if details is not None else None
+
+        async def body(conn: psycopg.AsyncConnection[tuple[object, ...]]) -> None:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "INSERT INTO __replicator_dlq_ingest "
+                    "(reject_id, stream_name, shard_id, reason, tx_id, record_id, "
+                    " chunk_id, error_message, raw_bytes, details_json) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        str(reject_id),
+                        stream_name,
+                        shard_id,
+                        reason,
+                        tx_id,
+                        record_id,
+                        chunk_id,
+                        error_message,
+                        raw_bytes,
+                        details_jsonb,
+                    ),
+                )
+
+        try:
+            await self._run(body)
+        except Exception as exc:
+            log.warning(
+                "dlq.ingest_reject.write_failed",
+                reason=reason,
+                stream=stream_name,
+                error=str(exc),
+            )
+            return uuid.UUID(int=0)
+        log.info(
+            "dlq.ingest_reject.recorded",
+            reject_id=str(reject_id),
+            reason=reason,
+            stream=stream_name,
+            shard=shard_id,
+            tx_id=tx_id,
+            chunk_id=chunk_id,
+        )
+        return reject_id
 
     # ---- queries --------------------------------------------------------
 

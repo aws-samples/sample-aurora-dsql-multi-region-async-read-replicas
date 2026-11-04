@@ -324,6 +324,30 @@ over-provisioning, not runaway.
   is lost.
 - **Cross-row application-level atomicity across the replica is not
   preserved** — only per-row order. This matches standard CDC behavior.
+- **Cross-transaction consistency on the replica is NOT preserved.** The
+  per-key LWW stamp (`__replicator_applied_v2`) delivers *eventual per-key
+  convergence* under out-of-order delivery; it does not deliver SQL
+  transaction-level consistency. A source transaction `T1(A, B)` can be
+  split across the replica if `T1.A` loses the LWW race to a later `T2.B`:
+  the replica then holds `(A@T1, B@T2)`, a state that never existed at the
+  source. Rows that lose the LWW race are archived to
+  `__replicator_late_discards` and surfaced on `RowsLateDiscarded`; alarm
+  on nonzero rate.
+- **The release watermark is NOT a source-side quiescence signal.** The
+  ordering buffer gates on `min(latest observed `source.ts_ns`)` across
+  shards, with an idle-shard synthetic advance when Kinesis
+  `MillisBehindLatest == 0`. "Caught up on Kinesis" is not "caught up on
+  source CDC emission" — a later-published older commit can still arrive.
+  Out-of-order releases are absorbed by the LWW stamp above. The
+  `WatermarkTsNs` metric is "max source ts we have decided to release past",
+  not an end-to-end lag.
+- **The DLQ fence is an operational pause, not a strict `ts_ns` commit
+  barrier.** When an apply failure opens a fence at `fence_ts_ns`, future
+  releases from the ordering buffer stop at `fence_ts_ns`. In-flight batch
+  tasks whose txns were dispatched before the fence was observed can still
+  COMMIT past `fence_ts_ns` — the fence doesn't revoke in-flight commits.
+  This matches a human operator's expectation of "stop and look," not a
+  strict atomic barrier.
 - **One source feeds one target per consumer process.** Fan-out to multiple
   targets means running multiple processes.
 - **No HTTPS admin surface** — all operator actions are CLI-driven.

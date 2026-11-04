@@ -65,12 +65,21 @@ CREATE TABLE IF NOT EXISTS __replicator_applied_v2 (
     PRIMARY KEY (schema_name, table_name, pk)
 )
 """
-# Per-key last-writer-wins bookkeeping. DSQL CDC is at-least-once, which means
-# a duplicate redelivery can arrive after we've already applied a different txn
-# on the same key (or an older txn can arrive late from a slow shard). Keeping
-# the latest applied source `ts_ns` per key, and only applying a row when its
-# `ts_ns` strictly exceeds the stored one, gives us idempotent LWW semantics
-# that converge to the source's committed state regardless of delivery order.
+# Per-key last-writer-wins bookkeeping. DSQL CDC is at-least-once and the
+# ordering-buffer release gate is NOT a source-side quiescence attestation
+# (see DESIGN.md "Known limits"), so a duplicate redelivery can arrive after
+# we've already applied a different txn on the same key, and an older-ts_ns
+# commit can still arrive after a newer one was applied. Keeping the latest
+# applied `source.ts_ns` per key, and only applying a row when its `ts_ns`
+# strictly exceeds the stored one, gives us **eventual per-key convergence**.
+#
+# This is NOT transaction-level SQL consistency. If source txn T1 touched rows
+# (A, B) and T2 touched B before T1.A arrived, the replica holds (A@T1, B@T2) —
+# a state that never existed at the source. Cross-row invariants held by T1
+# can be violated on the replica until T1 is fully applied or until a later
+# txn rewrites both keys. Rows that lose the LWW race are archived to
+# `__replicator_late_discards` and surfaced on the `RowsLateDiscarded`
+# CloudWatch metric for operator alarm.
 #
 # Replaces the earlier `(tx_id, record_id)` dedup, which blocked duplicate
 # redelivery from fixing a prior out-of-order apply.

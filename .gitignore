@@ -37,3 +37,9 @@ node_modules/
 build/
 dist/
 *.log
+
+# Private review artifacts — do not publish
+REVIEW_FIXES_SUMMARY.md
+REVIEW_FIXES_SUMMARY.pdf
+review_response.md
+review_response.pdf

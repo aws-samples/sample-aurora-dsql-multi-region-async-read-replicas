@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -66,7 +67,12 @@ class _FakeApplier:
     fail_batch_once: bool = False
     fail_single_tx_id: str | None = None
 
-    async def apply_batch(self, batch: list[CompletedTransaction]) -> list[ApplyResult]:
+    async def apply_batch(
+        self,
+        batch: list[CompletedTransaction],
+        *,
+        pre_commit_hook: Any = None,
+    ) -> list[ApplyResult]:
         self.batches.append(list(batch))
         if self.fail_batch_once:
             self.fail_batch_once = False
@@ -76,7 +82,12 @@ class _FakeApplier:
             for t in batch
         ]
 
-    async def apply(self, txn: CompletedTransaction) -> ApplyResult:
+    async def apply(
+        self,
+        txn: CompletedTransaction,
+        *,
+        pre_commit_hook: Any = None,
+    ) -> ApplyResult:
         self.singles.append(txn)
         if self.fail_single_tx_id is not None and txn.tx_id == self.fail_single_tx_id:
             raise ApplyError(f"test-induced single-txn failure on {txn.tx_id}")
@@ -94,6 +105,7 @@ def _bare_pipeline(batch_max_txns: int, batch_max_wait_ms: int) -> ConsumerPipel
     pipe = object.__new__(ConsumerPipeline)
     pipe._cfg = cfg  # type: ignore[attr-defined]
     pipe._stop = asyncio.Event()  # type: ignore[attr-defined]
+    pipe._stream_name = "test-stream"  # type: ignore[attr-defined]
     # Ordering buffer with one registered shard and a watermark that passes any ts_ns.
     buf = OrderingBuffer(
         idle_shard_timeout_seconds=0.0,
@@ -109,6 +121,12 @@ def _bare_pipeline(batch_max_txns: int, batch_max_wait_ms: int) -> ConsumerPipel
     pipe.rows_late_discarded = 0  # type: ignore[attr-defined]
     pipe.apply_errors = 0  # type: ignore[attr-defined]
     pipe.fences_opened = 0  # type: ignore[attr-defined]
+    pipe.checkpoints_flushed = 0  # type: ignore[attr-defined]
+    # Seq tracker: used by _make_checkpoint_hook. Empty is fine — the hook
+    # just no-ops on retire-not-found and skips the checkpoint upsert.
+    from dsql_replicator.state import ShardSeqTracker
+
+    pipe._seq_tracker = ShardSeqTracker()  # type: ignore[attr-defined]
     # _open_fence calls self._dlq.open_fence + self._ordering.set_fence; stub it.
     pipe._open_fence = AsyncMock()  # type: ignore[attr-defined]
     return pipe

@@ -1,17 +1,17 @@
 """Ordering buffer.
 
-Reassembled transactions arrive on different shards in different orders. The applier must
-commit them in strictly ascending `source.ts_ns` (spec I8). This stage holds a priority
+Reassembled transactions arrive on different shards in different orders. The applier
+commits them in approximately ascending `source.ts_ns`. This stage holds a priority
 queue keyed by `ts_ns` and releases its head only when both:
 
-  1. `head.ts_ns < W` where `W` is the low watermark across all shards — the smallest
-     `ts_ns` any shard may still deliver. We know `head` is safe only when every shard
-     has either produced records newer than `head.ts_ns` or declared itself idle under the
-     synthetic-advance rule (spec I9).
+  1. `head.ts_ns < W` where `W` is a best-effort low watermark across all shards
+     (see "Watermark honesty" below).
 
   2. No open DLQ fence covers `head.ts_ns`. When a fence is set at `fence_ts_ns`, the
-     applier stops at `head.ts_ns < fence_ts_ns`; everything from `fence_ts_ns` onward
-     waits for operator resolution.
+     applier stops at `head.ts_ns < fence_ts_ns`; everything from `fence_ts_ns`
+     onward waits for operator resolution. **This is an operational pause, not a
+     strict atomic barrier** — in-flight apply tasks dispatched before the fence
+     was observed may still commit past it. See DESIGN.md "Known limits".
 
 Watermark math per shard:
 
@@ -25,6 +25,29 @@ Watermark math per shard:
 Registered-but-never-reported shards contribute `0`, which freezes the pipeline until
 the consumer reports at least once per shard. The consumer is expected to call
 `update_shard()` every poll loop whether or not records arrived.
+
+Watermark honesty
+-----------------
+
+`W` as computed here is NOT a safe source-side transaction-release watermark and
+NOT an end-to-end replica-lag measurement. It mixes three signals:
+
+- **latest_ts_ns_seen** — the newest `source.ts_ns` we have observed on records
+  already read from this shard's Kinesis segment. It says nothing about whether
+  the source has queued older commits that have not yet been published.
+- **millis_behind_latest == 0** — Kinesis transport catch-up. Not a source-side
+  quiescence signal; a quiet Kinesis stream does not imply the source database
+  has stopped committing.
+- **wall_now_ns - clock_skew_budget_ns** — a synthetic advance anchored on the
+  replicator's wall clock, bounded only by a configurable skew budget. A source
+  commit with `ts_ns` *earlier* than this synthetic value can still arrive
+  afterwards; the ordering buffer has already released past it.
+
+As a result, the ordering buffer can — and will — release a transaction before
+every older-ts_ns record has arrived. Correctness downstream is defended by the
+per-key LWW stamp in `__replicator_applied_v2`, which rejects any row-write
+whose `ts_ns` is lower than the stored stamp for the same key. See
+`apply.py` and DESIGN.md "Known limits" for the full consistency contract.
 """
 
 from __future__ import annotations

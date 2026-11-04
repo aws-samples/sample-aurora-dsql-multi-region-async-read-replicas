@@ -54,9 +54,17 @@ def _build_dashboard(cfg: Config) -> dict[str, Any]:
         metric is emitted as a per-interval delta; 'Average' when it is a gauge
         sampled each interval.
         """
-        schema_dims = "TargetCluster,Stream,ProcessId"
-        if extra_dim and extra_dim not in schema_dims.split(","):
-            schema_dims = f"{schema_dims},{extra_dim}"
+        # CloudWatch SEARCH schema requires EXACT dim-set match. Single-process
+        # emission omits `ProcessId`; multi-process emission includes it. One
+        # SEARCH can't match both. We emit two parallel SEARCH entries — one
+        # per schema shape — so each widget renders whichever shape produced
+        # data this run. The empty one plots as a flat zero line and is
+        # harmless.
+        sp_schema = "TargetCluster,Stream"
+        mp_schema = "TargetCluster,Stream,ProcessId"
+        if extra_dim and extra_dim not in sp_schema.split(","):
+            sp_schema = f"{sp_schema},{extra_dim}"
+            mp_schema = f"{mp_schema},{extra_dim}"
         filters = f'TargetCluster="{tgt}" Stream="{stream}" MetricName="{metric_name}"'
         if extra_dim and extra_val is not None:
             filters += f' {extra_dim}="{extra_val}"'
@@ -76,10 +84,19 @@ def _build_dashboard(cfg: Config) -> dict[str, Any]:
                 "Flushed",
                 "Timeouts",
                 "Advances",
+                "Mismatches",
+                "Recorded",
             )
             inner_stat = "Sum" if any(metric_name.endswith(s) for s in counter_suffixes) else "Average"
-        expr = f"{agg}(SEARCH('{{{ns},{schema_dims}}} {filters}', '{inner_stat}', 60))"
-        return [{"expression": expr, "label": label or metric_name, "id": _safe_id(metric_name)}]
+        sp_expr = f"{agg}(SEARCH('{{{ns},{sp_schema}}} {filters}', '{inner_stat}', 60))"
+        mp_expr = f"{agg}(SEARCH('{{{ns},{mp_schema}}} {filters}', '{inner_stat}', 60))"
+        safe = _safe_id(metric_name)
+        # Each sub-array is one metric-math spec; the widget renders both as
+        # separate series. The empty schema plots as flat zero (harmless).
+        return [
+            [{"expression": sp_expr, "label": (label or metric_name), "id": f"{safe}_sp"}],
+            [{"expression": mp_expr, "label": f"{label or metric_name} (mp)", "id": f"{safe}_mp"}],
+        ]
 
     def _ts(
         title: str,
@@ -89,9 +106,18 @@ def _build_dashboard(cfg: Config) -> dict[str, Any]:
         w: int,
         h: int,
     ) -> dict[str, Any]:
-        # Each SEARCH entry is itself the sub-array [{expression:...}] expected by
-        # CloudWatch — pass through as-is; do NOT flatten.
-        flat_metrics: list[Any] = list(metric_entries)
+        # Each `_search(...)` returns a list of sub-arrays — one sub-array per
+        # schema shape (single-process / multi-process). CloudWatch's widget
+        # schema requires each entry in `metrics` to itself be a sub-array
+        # (`[{expression,label,id}]`), so we flatten exactly one level deep.
+        flat_metrics: list[Any] = []
+        for entry in metric_entries:
+            if isinstance(entry, list) and entry and isinstance(entry[0], list):
+                # Nested: a list of sub-arrays — spread.
+                flat_metrics.extend(entry)
+            else:
+                # Already a single sub-array.
+                flat_metrics.append(entry)
         return {
             "type": "metric",
             "x": x,
@@ -116,7 +142,14 @@ def _build_dashboard(cfg: Config) -> dict[str, Any]:
         w: int,
         h: int,
     ) -> dict[str, Any]:
-        flat_metrics: list[Any] = list(metric_entries)
+        # Same one-level flatten as `_ts`: `_search` returns a list of
+        # sub-arrays and each needs to appear as its own entry in `metrics`.
+        flat_metrics: list[Any] = []
+        for entry in metric_entries:
+            if isinstance(entry, list) and entry and isinstance(entry[0], list):
+                flat_metrics.extend(entry)
+            else:
+                flat_metrics.append(entry)
         return {
             "type": "metric",
             "x": x,
@@ -181,15 +214,22 @@ def _build_dashboard(cfg: Config) -> dict[str, Any]:
             24,
             6,
         ),
-        # Row 3 — errors + fence lifecycle
+        # Row 3 — errors + fence lifecycle. Includes the per-reason ingest-reject
+        # counters landed in review fix #2 so a reviewer can tell a parse_error
+        # drop from a crc_mismatch drop from a fragment_timeout drop from a
+        # txn_timeout drop — rather than one lumped "parse_errors" bucket that
+        # used to swallow CRC mismatches too.
         _ts(
             "Errors & fence lifecycle",
             [
                 _search("ApplyErrors", agg="SUM", label="ApplyErrors"),
                 _search("ParseErrors", agg="SUM", label="ParseErrors"),
+                _search("CrcMismatches", agg="SUM", label="CrcMismatches"),
+                _search("FragmentTimeouts", agg="SUM", label="FragmentTimeouts"),
+                _search("TxnTimeouts", agg="SUM", label="TxnTimeouts"),
+                _search("IngestRejectsRecorded", agg="SUM", label="IngestRejectsRecorded"),
                 _search("FencesOpened", agg="SUM", label="FencesOpened"),
                 _search("FencesClosedObserved", agg="SUM", label="FencesClosedObserved"),
-                _search("TxnTimeouts", agg="SUM", label="TxnTimeouts"),
             ],
             10,
             0,

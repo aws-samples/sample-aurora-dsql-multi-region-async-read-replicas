@@ -39,17 +39,37 @@ CREATE TABLE IF NOT EXISTS __replicator_dlq_payload (
 )
 """
 
+# Ingest-side rejects (parse errors, CRC mismatches, fragment/txn timeouts). These
+# never reached the applier, so there is no `tx_id`-keyed CompletedTransaction to
+# fence on — they are archived for forensics only, not a commit barrier. Keyed by
+# a UUID because the natural identifiers (chunk_id, tx_id) are often absent at
+# reject time (parse_error has no tx_id). See review doc issue #2.
+INGEST_REJECTS_DDL = """
+CREATE TABLE IF NOT EXISTS __replicator_dlq_ingest (
+    reject_id     uuid        PRIMARY KEY,
+    stream_name   text        NOT NULL,
+    shard_id      text,
+    reason        text        NOT NULL,
+    tx_id         text,
+    record_id     text,
+    chunk_id      text,
+    error_message text,
+    raw_bytes     bytea,
+    details_json  jsonb,
+    recorded_at   timestamptz NOT NULL DEFAULT now()
+)
+"""
+
 
 async def bootstrap_dlq_tables(conn: psycopg.AsyncConnection[tuple[object, ...]]) -> None:
-    """Create the DLQ fence + payload tables if they don't exist. Idempotent.
+    """Create the DLQ fence + payload + ingest-reject tables if they don't exist.
 
     DSQL only accepts one DDL statement per transaction (`FeatureNotSupported: multiple
     ddl statements not supported in a transaction`), so each CREATE runs in its own
-    implicit transaction.
+    implicit transaction. Idempotent — safe on every process start.
     """
-    async with conn.cursor() as cur:
-        await cur.execute(FENCES_DDL)
-        await conn.commit()
-        await cur.execute(PAYLOAD_DDL)
+    for ddl in (FENCES_DDL, PAYLOAD_DDL, INGEST_REJECTS_DDL):
+        async with conn.cursor() as cur:
+            await cur.execute(ddl)
         await conn.commit()
     log.info("dlq.schema.ready")

@@ -22,6 +22,7 @@ from .schema import (
     WATERMARK_STATE_DDL,
     bootstrap_state_tables,
 )
+from .seq_tracker import ShardSeqTracker
 
 __all__ = [
     "CHECKPOINTS_DDL",
@@ -31,5 +32,6 @@ __all__ = [
     "CheckpointRow",
     "LeaseRepo",
     "LeaseRow",
+    "ShardSeqTracker",
     "bootstrap_state_tables",
 ]
