@@ -1,0 +1,618 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DSQL CDC Replicator — Design Tour</title>
+<style>
+  :root {
+    --bg:#0e1116; --panel:#161b22; --panel2:#1a2029; --muted:#8b98a5; --fg:#e6edf3;
+    --accent:#4fb3ff; --accent2:#67c76f; --warn:#f0a05c; --danger:#f5737a; --violet:#b084eb;
+    --dim:#2a323c; --rule:#263040;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,system-ui,sans-serif;
+  }
+  html,body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.55 var(--sans);}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  main{max-width:1180px;margin:0 auto;padding:24px 20px 80px}
+  header{display:flex;align-items:baseline;justify-content:space-between;gap:16px;margin-bottom:4px}
+  header h1{font-size:22px;font-weight:600;margin:0}
+  header .tag{color:var(--muted);font-family:var(--mono);font-size:12px}
+  .lede{color:var(--muted);margin:6px 0 20px;max-width:72ch}
+  .scenarios{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px}
+  .scenarios button{
+    background:var(--panel);color:var(--fg);border:1px solid var(--rule);
+    padding:6px 12px;border-radius:999px;font:12px/1 var(--sans);cursor:pointer;
+  }
+  .scenarios button:hover{border-color:var(--accent)}
+  .scenarios button.active{background:var(--accent);border-color:var(--accent);color:#0b1017;font-weight:600}
+  .legend{display:flex;flex-wrap:wrap;gap:14px;margin:0 0 14px;color:var(--muted);font-size:12px}
+  .legend .chip{display:inline-flex;align-items:center;gap:6px}
+  .legend .sw{display:inline-block;width:14px;height:10px;border-radius:3px}
+  .sw.on{background:var(--accent)}
+  .sw.ok{background:var(--accent2)}
+  .sw.warn{background:var(--warn)}
+  .sw.danger{background:var(--danger)}
+  .sw.audit{background:var(--violet)}
+  .board{display:grid;grid-template-columns:1fr 320px;gap:16px;align-items:start}
+  .diagram{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:14px;overflow:hidden}
+  .side{display:flex;flex-direction:column;gap:12px}
+  .step{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:14px}
+  .step h2{margin:0 0 4px;font-size:14px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+  .step h3{margin:0 0 10px;font-size:17px;font-weight:600}
+  .step p{margin:0 0 8px}
+  .step code{font-family:var(--mono);background:var(--panel2);padding:1px 5px;border-radius:4px;font-size:12.5px;color:#d8dde3}
+  .status{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:14px}
+  .status h4{margin:0 0 8px;font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+  .status table{width:100%;border-collapse:collapse;font-size:12.5px}
+  .status td{padding:4px 0;border-top:1px solid var(--rule)}
+  .status td.k{color:var(--muted);padding-right:10px;width:48%}
+  .status td.v{font-family:var(--mono);color:var(--fg)}
+  .status td.v.on{color:var(--accent)}
+  .status td.v.ok{color:var(--accent2)}
+  .status td.v.warn{color:var(--warn)}
+  .status td.v.danger{color:var(--danger)}
+  .status td.v.audit{color:var(--violet)}
+  .controls{display:flex;align-items:center;gap:6px;margin-top:10px}
+  .controls button{
+    background:var(--panel2);color:var(--fg);border:1px solid var(--rule);
+    padding:6px 10px;border-radius:6px;font:12px/1 var(--sans);cursor:pointer;
+  }
+  .controls button:hover{border-color:var(--accent)}
+  .controls .counter{margin-left:auto;color:var(--muted);font-family:var(--mono);font-size:12px}
+  .hint{color:var(--muted);font-size:11.5px;margin-top:8px}
+  svg{display:block;width:100%;height:auto}
+  /* --- SVG state classes --- */
+  .node rect, .node path{fill:var(--panel2);stroke:var(--rule);stroke-width:1.2}
+  .node text{fill:var(--fg);font:12px var(--sans)}
+  .node .sub{fill:var(--muted);font:10px var(--mono)}
+  .node.on rect, .node.on path{stroke:var(--accent);stroke-width:2;fill:#0f2434}
+  .node.ok rect, .node.ok path{stroke:var(--accent2);stroke-width:2;fill:#0f2a16}
+  .node.warn rect, .node.warn path{stroke:var(--warn);stroke-width:2;fill:#2b1f0f}
+  .node.danger rect, .node.danger path{stroke:var(--danger);stroke-width:2;fill:#2b0f12}
+  .node.audit rect, .node.audit path{stroke:var(--violet);stroke-width:2;fill:#1b1230}
+  .node.dim rect, .node.dim path{opacity:.35}
+  .edge{fill:none;stroke:#3a4452;stroke-width:1.4}
+  .edge.on{stroke:var(--accent);stroke-width:2.4}
+  .edge.ok{stroke:var(--accent2);stroke-width:2.4}
+  .edge.warn{stroke:var(--warn);stroke-width:2.4;stroke-dasharray:4 3}
+  .edge.danger{stroke:var(--danger);stroke-width:2.4;stroke-dasharray:4 3}
+  .edge.audit{stroke:var(--violet);stroke-width:2.4}
+  .edge.dim{opacity:.3}
+  .shard-label{fill:var(--muted);font:10px var(--mono)}
+  .arrowhead{fill:#3a4452}
+  .arrowhead.on{fill:var(--accent)}
+  .arrowhead.ok{fill:var(--accent2)}
+  .arrowhead.warn{fill:var(--warn)}
+  .arrowhead.danger{fill:var(--danger)}
+  .arrowhead.audit{fill:var(--violet)}
+  .pulse{animation:pulse 1.1s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  footer{color:var(--muted);font-size:12px;margin-top:28px;padding-top:14px;border-top:1px solid var(--rule)}
+  @media (max-width:900px){.board{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div>
+    <h1>DSQL CDC Replicator — Design Tour</h1>
+    <div class="lede">
+      Interactive walk through the correctness-critical paths and the six issues raised in review.
+      Pick a scenario, step through it, watch the state panel.
+    </div>
+  </div>
+  <div class="tag">aws-samples / sample-aurora-dsql-multi-region-async-read-replicas</div>
+</header>
+
+<div class="scenarios" id="scenarios"></div>
+
+<div class="legend">
+  <span class="chip"><span class="sw on"></span>in-flight / active</span>
+  <span class="chip"><span class="sw ok"></span>applied / safe</span>
+  <span class="chip"><span class="sw warn"></span>reroute / timeout</span>
+  <span class="chip"><span class="sw danger"></span>failure / halt</span>
+  <span class="chip"><span class="sw audit"></span>audit / LWW discard</span>
+</div>
+
+<div class="board">
+  <div class="diagram">
+    <!-- 1120 x 520 base SVG -->
+    <svg id="diagram" viewBox="0 0 1120 520" xmlns="http://www.w3.org/2000/svg" aria-labelledby="dgtitle">
+      <title id="dgtitle">Replicator topology</title>
+      <defs>
+        <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" class="arrowhead" />
+        </marker>
+        <marker id="ah-on" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" class="arrowhead on" />
+        </marker>
+        <marker id="ah-ok" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" class="arrowhead ok" />
+        </marker>
+        <marker id="ah-warn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" class="arrowhead warn" />
+        </marker>
+        <marker id="ah-danger" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" class="arrowhead danger" />
+        </marker>
+        <marker id="ah-audit" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M 0 0 L 10 5 L 0 10 z" class="arrowhead audit" />
+        </marker>
+      </defs>
+
+      <!-- Kinesis stream + 4 shards -->
+      <g class="node" id="n-kinesis">
+        <rect x="20" y="40" width="150" height="430" rx="10"/>
+        <text x="95" y="62" text-anchor="middle">Kinesis stream</text>
+        <text x="95" y="78" text-anchor="middle" class="sub">source CDC</text>
+      </g>
+      <g class="node" id="n-shard-0"><rect x="40" y="100" width="110" height="68" rx="6"/><text x="95" y="130" text-anchor="middle">shard 0</text><text x="95" y="148" text-anchor="middle" class="sub">seq N..</text></g>
+      <g class="node" id="n-shard-1"><rect x="40" y="188" width="110" height="68" rx="6"/><text x="95" y="218" text-anchor="middle">shard 1</text><text x="95" y="236" text-anchor="middle" class="sub">seq N..</text></g>
+      <g class="node" id="n-shard-2"><rect x="40" y="276" width="110" height="68" rx="6"/><text x="95" y="306" text-anchor="middle">shard 2</text><text x="95" y="324" text-anchor="middle" class="sub">seq N..</text></g>
+      <g class="node" id="n-shard-3"><rect x="40" y="364" width="110" height="68" rx="6"/><text x="95" y="394" text-anchor="middle">shard 3</text><text x="95" y="412" text-anchor="middle" class="sub">seq N..</text></g>
+
+      <!-- envelope parse -->
+      <g class="node" id="n-parse">
+        <rect x="220" y="100" width="140" height="80" rx="8"/>
+        <text x="290" y="128" text-anchor="middle">envelope.parse</text>
+        <text x="290" y="146" text-anchor="middle" class="sub">per-record</text>
+        <text x="290" y="162" text-anchor="middle" class="sub">per-shard worker</text>
+      </g>
+
+      <!-- Fragment reassembler (process-global, fix #4) -->
+      <g class="node" id="n-fragment">
+        <rect x="220" y="210" width="140" height="80" rx="8"/>
+        <text x="290" y="238" text-anchor="middle">FragmentReassembler</text>
+        <text x="290" y="256" text-anchor="middle" class="sub">process-global (fix #4)</text>
+        <text x="290" y="272" text-anchor="middle" class="sub">chunk_id → fragments</text>
+      </g>
+
+      <!-- Txn reassembler (process-global) -->
+      <g class="node" id="n-txn">
+        <rect x="220" y="320" width="140" height="80" rx="8"/>
+        <text x="290" y="348" text-anchor="middle">TransactionReassembler</text>
+        <text x="290" y="366" text-anchor="middle" class="sub">process-global</text>
+        <text x="290" y="382" text-anchor="middle" class="sub">tx_id → records</text>
+      </g>
+
+      <!-- Ordering buffer -->
+      <g class="node" id="n-ordering">
+        <rect x="420" y="210" width="150" height="80" rx="8"/>
+        <text x="495" y="238" text-anchor="middle">OrderingBuffer</text>
+        <text x="495" y="256" text-anchor="middle" class="sub">heap by ts_ns</text>
+        <text x="495" y="272" text-anchor="middle" class="sub">watermark + fence gate</text>
+      </g>
+
+      <!-- Seq tracker -->
+      <g class="node" id="n-tracker">
+        <rect x="420" y="320" width="150" height="80" rx="8"/>
+        <text x="495" y="348" text-anchor="middle">ShardSeqTracker</text>
+        <text x="495" y="366" text-anchor="middle" class="sub">in_flight / retired (fix #1)</text>
+        <text x="495" y="382" text-anchor="middle" class="sub">per-shard safe seq</text>
+      </g>
+
+      <!-- Applier -->
+      <g class="node" id="n-applier">
+        <rect x="620" y="210" width="160" height="80" rx="8"/>
+        <text x="700" y="238" text-anchor="middle">Applier</text>
+        <text x="700" y="256" text-anchor="middle" class="sub">stripe-locked parallel</text>
+        <text x="700" y="272" text-anchor="middle" class="sub">BEGIN..pre_commit..COMMIT</text>
+      </g>
+
+      <!-- Target DSQL + sub-tables -->
+      <g class="node" id="n-target">
+        <rect x="830" y="40" width="260" height="430" rx="10"/>
+        <text x="960" y="62" text-anchor="middle">Target DSQL</text>
+        <text x="960" y="78" text-anchor="middle" class="sub">cross-region</text>
+      </g>
+      <g class="node" id="n-rows">
+        <rect x="855" y="100" width="210" height="60" rx="6"/>
+        <text x="960" y="124" text-anchor="middle">application tables</text>
+        <text x="960" y="142" text-anchor="middle" class="sub">user rows (INSERT/UPSERT/DELETE)</text>
+      </g>
+      <g class="node" id="n-applied">
+        <rect x="855" y="170" width="210" height="54" rx="6"/>
+        <text x="960" y="192" text-anchor="middle">__replicator_applied_v2</text>
+        <text x="960" y="210" text-anchor="middle" class="sub">per-key LWW stamp</text>
+      </g>
+      <g class="node" id="n-checkpoints">
+        <rect x="855" y="234" width="210" height="54" rx="6"/>
+        <text x="960" y="256" text-anchor="middle">__replicator_checkpoints</text>
+        <text x="960" y="274" text-anchor="middle" class="sub">per-shard safe seq (fix #1)</text>
+      </g>
+      <g class="node" id="n-late">
+        <rect x="855" y="298" width="210" height="54" rx="6"/>
+        <text x="960" y="320" text-anchor="middle">__replicator_late_discards</text>
+        <text x="960" y="338" text-anchor="middle" class="sub">LWW audit (fix #5)</text>
+      </g>
+      <g class="node" id="n-dlq-ingest">
+        <rect x="855" y="362" width="210" height="54" rx="6"/>
+        <text x="960" y="384" text-anchor="middle">__replicator_dlq_ingest</text>
+        <text x="960" y="402" text-anchor="middle" class="sub">parse/CRC/timeout (fix #2)</text>
+      </g>
+      <g class="node" id="n-dlq-fence">
+        <rect x="855" y="420" width="210" height="40" rx="6"/>
+        <text x="960" y="442" text-anchor="middle">__replicator_dlq_fences</text>
+        <text x="960" y="456" text-anchor="middle" class="sub">operational pause (fix #6)</text>
+      </g>
+
+      <!-- Edges -->
+      <path id="e-shards-parse" class="edge" d="M 150 134 C 180 134, 190 140, 220 140" marker-end="url(#ah)"/>
+      <path id="e-parse-fragment" class="edge" d="M 290 180 L 290 210" marker-end="url(#ah)"/>
+      <path id="e-fragment-txn" class="edge" d="M 290 290 L 290 320" marker-end="url(#ah)"/>
+      <path id="e-txn-ordering" class="edge" d="M 360 360 C 390 360, 390 250, 420 250" marker-end="url(#ah)"/>
+      <path id="e-ordering-applier" class="edge" d="M 570 250 L 620 250" marker-end="url(#ah)"/>
+      <path id="e-applier-rows" class="edge" d="M 780 240 C 820 240, 820 130, 855 130" marker-end="url(#ah)"/>
+      <path id="e-applier-applied" class="edge" d="M 780 250 C 820 250, 820 197, 855 197" marker-end="url(#ah)"/>
+      <path id="e-applier-ckpt" class="edge" d="M 780 260 C 820 260, 820 261, 855 261" marker-end="url(#ah)"/>
+      <path id="e-applier-late" class="edge" d="M 780 275 C 820 275, 820 325, 855 325" marker-end="url(#ah)"/>
+      <!-- From parse / sweepers to dlq_ingest -->
+      <path id="e-parse-dlq" class="edge" d="M 360 150 C 500 150, 700 150, 855 388" marker-end="url(#ah)"/>
+      <!-- From applier to fence (open on apply error) -->
+      <path id="e-applier-fence" class="edge" d="M 780 290 C 820 290, 820 440, 855 440" marker-end="url(#ah)"/>
+      <!-- Seq tracker touches parse (enroll) and applier (retire+upsert) -->
+      <path id="e-parse-tracker" class="edge" d="M 290 180 C 320 230, 390 360, 420 360" marker-end="url(#ah)"/>
+      <path id="e-tracker-applier" class="edge" d="M 570 360 C 600 360, 620 300, 640 290" marker-end="url(#ah)"/>
+    </svg>
+  </div>
+
+  <div class="side">
+    <div class="step" id="step">
+      <h2 id="step-tag">Step 1 / 1</h2>
+      <h3 id="step-title">Overview</h3>
+      <p id="step-desc"></p>
+      <div class="controls">
+        <button id="btn-prev">◀ Prev</button>
+        <button id="btn-play">▶ Play</button>
+        <button id="btn-next">Next ▶</button>
+        <button id="btn-reset">Reset</button>
+        <span class="counter" id="counter">1 / 1</span>
+      </div>
+      <div class="hint">space = play/pause · ← → = step · R = reset</div>
+    </div>
+
+    <div class="status">
+      <h4>State</h4>
+      <table><tbody id="state-tbl"></tbody></table>
+    </div>
+
+    <div class="status">
+      <h4>Review issue</h4>
+      <table><tbody id="issue-tbl"></tbody></table>
+    </div>
+  </div>
+</div>
+
+<footer>
+  Load-test proof (c5f49c6, 30-min run at 50 TPS): 15,392 txns applied, 410 ingest-side rejects routed, 0 txn timeouts across 5,506 cross-shard chunked txns, 0 apply errors, 3,239 atomic checkpoint upserts.
+  Full write-up in <a href="DESIGN.md">docs/DESIGN.md</a>. Source: <a href="https://github.com/aws-samples/sample-aurora-dsql-multi-region-async-read-replicas">aws-samples/sample-aurora-dsql-multi-region-async-read-replicas</a>.
+</footer>
+</main>
+
+<script>
+// -----------------------------------------------------------------------------
+// Scenarios. Each step mutates the SVG via node / edge class lists, and renders
+// the state table and the issue mapping. The data-model is deliberately tiny
+// so you can see what a step does at a glance.
+// -----------------------------------------------------------------------------
+const scenarios = {
+  "overview": {
+    label: "Overview",
+    issue: null,
+    steps: [
+      {
+        title: "At rest",
+        desc: "Source emits CDC into Kinesis (4 shards). Shard workers parse envelopes; a single process-global FragmentReassembler and TransactionReassembler stitch cross-shard chunks and txns. The ordering buffer gates releases on a watermark + optional fence. The applier commits each batch in one DSQL BEGIN..COMMIT with four sub-writes: the row(s), the LWW stamp, the ingest-reject sweep (if any), and the per-shard checkpoint — all atomic.",
+        on: ["n-kinesis","n-shard-0","n-shard-1","n-shard-2","n-shard-3","n-parse","n-fragment","n-txn","n-ordering","n-tracker","n-applier","n-target","n-rows","n-applied","n-checkpoints","n-late","n-dlq-ingest","n-dlq-fence"],
+        state: {
+          "Mode": ["Idle", ""],
+          "Shards registered": ["4", "ok"],
+          "In-flight txns": ["0", ""],
+          "Watermark": ["unset", ""],
+          "Fence": ["none", "ok"],
+        }
+      }
+    ]
+  },
+
+  "happy-path": {
+    label: "Happy path (apply + atomic checkpoint)",
+    issue: "#1 atomic checkpoint",
+    steps: [
+      { title: "Record arrives on shard 2",
+        desc: "A full envelope lands in Kinesis shard 2. The shard worker reads it and bumps the Kinesis sequence counter.",
+        on: ["n-kinesis","n-shard-2","n-parse"], edge: ["e-shards-parse"],
+        state: {"Shard": ["shard 2", "on"], "Seq": ["49600...842", "on"], "In-flight on tracker": ["0", ""]} },
+      { title: "envelope.parse → enroll in tracker",
+        desc: "Parse succeeds. The pipeline enrolls (shard_id, seq, tx_id, record_id) in the per-shard sequence tracker. Nothing is checkpointed yet.",
+        on: ["n-parse","n-tracker"], edge: ["e-parse-tracker"],
+        state: {"Shard": ["shard 2", "on"], "In-flight on tracker": ["1", "on"], "Checkpoint persisted": ["(unchanged)", ""]} },
+      { title: "Txn is complete → ordering buffer",
+        desc: "The single-record txn drops straight into the ordering buffer, keyed by source.ts_ns.",
+        on: ["n-txn","n-ordering"], edge: ["e-fragment-txn","e-txn-ordering"],
+        state: {"Buffered txns": ["1", "on"], "Head ts_ns": ["1700000...", "on"], "Fence": ["none", "ok"]} },
+      { title: "Release past watermark → applier",
+        desc: "The watermark advances past head.ts_ns (every shard either has newer data or is idle). The applier pops the txn and acquires its stripe locks.",
+        on: ["n-ordering","n-applier"], edge: ["e-ordering-applier"],
+        state: {"Watermark": ["1700000...+", "ok"], "Dispatched": ["1", "on"], "Stripes held": ["[7]", "on"]} },
+      { title: "pre_commit_hook: retire + upsert checkpoint",
+        desc: "Inside the open DSQL txn, _make_checkpoint_hook retires the record's seq in the tracker, computes safe_checkpoint(shard 2), and writes __replicator_checkpoints atomically. If anything after this raises, EVERYTHING rolls back together — including the checkpoint upsert.",
+        on: ["n-applier","n-tracker","n-checkpoints"], edge: ["e-tracker-applier","e-applier-ckpt"],
+        state: {"Retired this batch": ["1 seq", "ok"], "Safe seq (shard 2)": ["49600...842", "ok"], "Checkpoint upsert": ["IN TXN", "on"]} },
+      { title: "COMMIT",
+        desc: "The DSQL transaction commits: user row + LWW stamp + checkpoint, atomically. Crash now and restart from the stored seq → nothing is lost and nothing re-applies.",
+        on: ["n-applier","n-rows","n-applied","n-checkpoints"], edge: ["e-applier-rows","e-applier-applied","e-applier-ckpt"],
+        state: {"Rows applied": ["1", "ok"], "Stamp written": ["yes", "ok"], "Checkpoint committed": ["49600...842", "ok"], "Txn committed": ["yes", "ok"]} },
+    ]
+  },
+
+  "cross-shard-chunk": {
+    label: "Cross-shard chunked txn",
+    issue: "#4 FragmentReassembler was per-shard",
+    steps: [
+      { title: "Chunked main lands on shard 0",
+        desc: "A chunked record's main envelope arrives on shard 0 with chunked.after = { chunk_id: 'c-abc', total_fragments: 3, crc32c: X }.",
+        on: ["n-shard-0","n-parse","n-fragment"], edge: ["e-shards-parse","e-parse-fragment"],
+        state: {"Shard": ["shard 0", "on"], "chunk_id": ["c-abc", "on"], "fragments seen": ["0/3", "warn"]} },
+      { title: "Fragments 0,1 land on shards 1,2",
+        desc: "Fragments with the same chunk_id arrive on DIFFERENT Kinesis shards. The process-global FragmentReassembler buffers them into one chunk record.",
+        on: ["n-shard-1","n-shard-2","n-parse","n-fragment"], edge: ["e-parse-fragment"],
+        state: {"Shard trail": ["0, 1, 2", "on"], "fragments seen": ["2/3", "warn"], "Reassembler scope": ["process-global", "ok"]} },
+      { title: "Fragment 2 on shard 3 → assembled",
+        desc: "The last fragment lands on shard 3. CRC32C matches. The AssembledRecord is emitted and flows into the transaction reassembler.",
+        on: ["n-shard-3","n-fragment","n-txn"], edge: ["e-parse-fragment","e-fragment-txn"],
+        state: {"Shard trail": ["0, 1, 2, 3", "ok"], "fragments seen": ["3/3", "ok"], "CRC32C": ["match", "ok"]} },
+      { title: "Apply commits — 4 shards' checkpoints advance together",
+        desc: "The pre_commit_hook retires every (shard, seq) contributed by main+fragments. Each affected shard's safe_checkpoint() is recomputed and upserted — all four within the one DSQL transaction.",
+        on: ["n-applier","n-tracker","n-checkpoints","n-rows","n-applied"], edge: ["e-ordering-applier","e-applier-rows","e-applier-ckpt","e-applier-applied"],
+        state: {"Shards checkpointed": ["4 (0,1,2,3)", "ok"], "If #4 regressed": ["txn_timeouts++ (silent loss)", "danger"], "This run": ["0 txn_timeouts over 5,506 chunked txns", "ok"]} },
+    ]
+  },
+
+  "atomic-checkpoint": {
+    label: "Crash recovery (atomic checkpoint)",
+    issue: "#1 checkpoint could race ahead of buffered data",
+    steps: [
+      { title: "Scenario: pre-fix (BAD)",
+        desc: "In the old design a timer flushed __replicator_checkpoints to the latest *consumed* Kinesis seq every N ms — regardless of whether those records had been applied. Records still in reassembly could be checkpointed over.",
+        on: ["n-parse","n-fragment","n-txn","n-checkpoints"], edge: ["e-applier-ckpt"],
+        state: {"Mode": ["pre-fix (timer flush)", "danger"], "Checkpoint source": ["latest consumed seq", "danger"], "Records still in buffer": ["silently at risk", "danger"]} },
+      { title: "Crash with records in reassembly",
+        desc: "Records R6..R10 are buffered awaiting the last fragment. The timer fires and persists checkpoint = R10. The process crashes.",
+        on: ["n-fragment","n-txn"],
+        state: {"Buffered (seqs)": ["R6..R10", "warn"], "Checkpoint persisted": ["R10 (pre-fix)", "danger"], "Durable on target": ["none of them", "danger"]} },
+      { title: "Restart from AFTER R10 → DATA LOSS (pre-fix)",
+        desc: "On restart the shard iterator resumes AFTER R10. Kinesis will not re-serve R6..R10. The in-flight txn times out silently. The reviewer flagged this exact sequence.",
+        on: ["n-shard-0","n-parse"], edge: ["e-shards-parse"],
+        state: {"Resumed from": ["R10+1", "danger"], "Lost records": ["R6..R10", "danger"], "User-visible": ["silent — no fence", "danger"]} },
+      { title: "Post-fix: ShardSeqTracker gates the checkpoint",
+        desc: "Every record is enrolled on parse and retired only on applied-OR-rejected. safe_checkpoint(shard) returns the max retired seq strictly less than min(in_flight) — never past buffered data. The timer path is deleted.",
+        on: ["n-tracker","n-checkpoints"], edge: ["e-tracker-applier","e-applier-ckpt"],
+        state: {"Mode": ["post-fix (pre_commit_hook)", "ok"], "Blocking seq": ["R6 (still in buffer)", "warn"], "Checkpoint allowed to advance to": ["R5", "ok"]} },
+      { title: "Crash + restart → nothing lost",
+        desc: "Same crash, but checkpoint = R5 (safe). On restart the shard iterator resumes AFTER R5. R6..R10 are re-fetched; the LWW stamp dedupes anything that happened to apply before the crash.",
+        on: ["n-shard-0","n-parse","n-fragment","n-txn","n-applied"], edge: ["e-shards-parse","e-parse-fragment","e-fragment-txn","e-applier-applied"],
+        state: {"Resumed from": ["R5+1", "ok"], "Replayed": ["R6..R10", "ok"], "Load-test proof": ["40 crash-replay dedups observed", "ok"]} },
+    ]
+  },
+
+  "lww-race": {
+    label: "Out-of-order LWW",
+    issue: "#5 LWW is per-key, not SQL-level",
+    steps: [
+      { title: "T2 writes key B at ts=200",
+        desc: "A later source transaction T2 touches key B. It applies cleanly and the stamp table stores (B → applied_ts_ns=200).",
+        on: ["n-applier","n-rows","n-applied"], edge: ["e-applier-rows","e-applier-applied"],
+        state: {"Key": ["B", "on"], "Applied ts": ["200", "ok"], "Stamp(B)": ["200", "ok"]} },
+      { title: "T1(A,B) at ts=100 — A is already applied",
+        desc: "An older source transaction T1 touched both A and B atomically at ts=100. T1.A arrived first and applied; T1.B is still in the ordering buffer waiting. The reorder is permitted by the watermark (see issue #3).",
+        on: ["n-ordering","n-rows"], edge: ["e-ordering-applier"],
+        state: {"T1.A applied": ["ts=100 ok", "ok"], "T1.B": ["buffered, ts=100", "warn"], "Replica state": ["A@T1, B@T2", "warn"]} },
+      { title: "T1.B dispatched → LWW rejects",
+        desc: "T1.B reaches the applier. The stamp lookup finds stored_ts=200 for key B. Because incoming_ts=100 is strictly less than stored_ts, the UPSERT is gated and the row is NOT applied. Convergence is preserved per-key.",
+        on: ["n-applier","n-applied","n-late"], edge: ["e-applier-applied","e-applier-late"],
+        state: {"Stamp(B) stored": ["200", "ok"], "Incoming T1.B": ["100", "warn"], "Decision": ["REJECT (older)", "warn"]} },
+      { title: "Audit to __replicator_late_discards",
+        desc: "The rejected record is written to the audit table inside the same DSQL txn as the stamp lookup, with full payload. CloudWatch metric RowsLateDiscarded ticks.",
+        on: ["n-applier","n-late"], edge: ["e-applier-late"],
+        state: {"Audit row written": ["yes", "audit"], "Replica now holds": ["(A@T1, B@T2) — cross-txn inconsistent", "warn"], "Reviewer caveat (#5)": ["eventual per-key, NOT SQL consistency", "warn"]} },
+    ]
+  },
+
+  "ingest-dlq": {
+    label: "Ingest-side reject → DLQ",
+    issue: "#2 previously silent drops",
+    steps: [
+      { title: "Malformed envelope arrives",
+        desc: "A record on shard 1 fails envelope.parse (e.g. truncated JSON, unknown type).",
+        on: ["n-shard-1","n-parse"], edge: ["e-shards-parse"],
+        state: {"Reason": ["parse_error", "warn"], "Raw bytes": ["kept", "warn"]} },
+      { title: "Enroll + retire by seq",
+        desc: "The pipeline enrolls the record's (shard_id, seq) in the tracker and immediately retires by seq. This keeps the checkpoint unblocked while the record is being dispositioned.",
+        on: ["n-parse","n-tracker"], edge: ["e-parse-tracker"],
+        state: {"Tracker state": ["(shard 1, seq) retired", "ok"], "Checkpoint can advance": ["yes, past this seq", "ok"]} },
+      { title: "Route to __replicator_dlq_ingest",
+        desc: "DlqWriter.record_ingest_reject inserts a row with reason='parse_error' and the raw bytes. Fails open — any transient write failure is logged and the ingest loop continues.",
+        on: ["n-parse","n-dlq-ingest"], edge: ["e-parse-dlq"],
+        state: {"Row written": ["uuid, parse_error, raw_bytes", "warn"], "CloudWatch metric": ["ParseErrors += 1", "warn"], "Operator signal": ["dashboard + alarm", "warn"]} },
+      { title: "Same path for CRC / fragment / txn timeouts",
+        desc: "crc_mismatch, fragment_timeout, txn_timeout all route through the same _record_ingest_reject helper. 30-min load test captured 342 parse + 34 CRC + 34 fragment = 410 total — none dropped silently.",
+        on: ["n-dlq-ingest"],
+        state: {"parse_errors": ["342", "warn"], "crc_mismatches": ["34", "warn"], "fragment_timeouts": ["34", "warn"], "ingest_rejects_recorded": ["410 ✓", "ok"]} },
+    ]
+  },
+
+  "fence-pause": {
+    label: "Apply failure → fence",
+    issue: "#6 fence is operational pause, not strict barrier",
+    steps: [
+      { title: "Apply failure on tx at ts=T_bad",
+        desc: "A txn hits a non-retryable error at commit time (e.g. schema mismatch). The applier raises ApplyError.",
+        on: ["n-applier"],
+        state: {"Failing txn ts_ns": ["T_bad", "danger"], "Attempts": ["5 (exhausted)", "danger"]} },
+      { title: "Fence opens at T_bad",
+        desc: "DlqWriter.open_fence writes a row into __replicator_dlq_fences AND the full payload into __replicator_dlq_payload — atomically — then sets self._ordering.fence_ts_ns = T_bad.",
+        on: ["n-dlq-fence","n-ordering"], edge: ["e-applier-fence"],
+        state: {"Fence row": ["OPEN at T_bad", "danger"], "Ordering release gate": ["< min(watermark, T_bad)", "warn"]} },
+      { title: "Operational pause (not strict barrier)",
+        desc: "The ordering buffer stops RELEASING txns past T_bad. In-flight batches dispatched before fenced.set() was observed are still inside their DSQL txns and can COMMIT past T_bad. The applier's commit path does NOT re-check the fence state before COMMIT. This is a conscious trade-off — a strict barrier would add a round-trip per commit.",
+        on: ["n-dlq-fence","n-applier","n-ordering"],
+        state: {"Future releases": ["halted at T_bad", "ok"], "In-flight commits past T_bad": ["can land", "warn"], "Framing (reviewer #6)": ["operational pause", "warn"]} },
+      { title: "Operator runs ops dlq retry / skip",
+        desc: "The fence row flips to CLOSED (retry succeeded) or SKIPPED (operator decision). The in-memory fence clears via the fence poller and the ordering buffer resumes.",
+        on: ["n-dlq-fence","n-ordering"],
+        state: {"Fence status": ["CLOSED or SKIPPED", "ok"], "Ordering buffer": ["draining past T_bad", "on"]} },
+    ]
+  },
+};
+
+// -----------------------------------------------------------------------------
+// Rendering
+// -----------------------------------------------------------------------------
+const scenarioNames = Object.keys(scenarios);
+let currentScenario = scenarioNames[0];
+let currentStep = 0;
+let playing = false;
+let playTimer = null;
+
+function el(id) { return document.getElementById(id); }
+
+function renderScenarioTabs() {
+  const bar = el("scenarios");
+  bar.innerHTML = "";
+  for (const key of scenarioNames) {
+    const b = document.createElement("button");
+    b.textContent = scenarios[key].label;
+    b.dataset.key = key;
+    if (key === currentScenario) b.classList.add("active");
+    b.onclick = () => { currentScenario = key; currentStep = 0; stopPlay(); renderAll(); };
+    bar.appendChild(b);
+  }
+}
+
+function clearSvgState() {
+  for (const n of document.querySelectorAll("#diagram .node")) {
+    n.classList.remove("on","ok","warn","danger","audit","dim");
+  }
+  for (const e of document.querySelectorAll("#diagram .edge")) {
+    e.classList.remove("on","ok","warn","danger","audit","dim");
+    // Reset marker-end to default arrowhead.
+    const id = e.id;
+    e.setAttribute("marker-end", "url(#ah)");
+  }
+}
+
+function applyStep() {
+  const s = scenarios[currentScenario].steps[currentStep];
+  clearSvgState();
+  // Dim everything that's not called out this step, except the base topology.
+  // We color explicit nodes/edges to make the active flow pop.
+  const onList = s.on || [];
+  const edgeList = s.edge || [];
+  // Default most nodes to "dim" so active nodes read as foreground.
+  for (const n of document.querySelectorAll("#diagram .node")) {
+    if (!onList.includes(n.id)) n.classList.add("dim");
+  }
+  for (const n of onList) {
+    const node = el(n);
+    if (node) {
+      // Pick color based on step state keys for a bit of accent (optional).
+      const cls = inferAccent(s);
+      node.classList.remove("dim");
+      node.classList.add(cls);
+    }
+  }
+  for (const eid of edgeList) {
+    const edge = el(eid);
+    if (edge) {
+      const cls = inferAccent(s);
+      edge.classList.add(cls);
+      edge.setAttribute("marker-end", "url(#ah-" + cls + ")");
+    }
+  }
+  // Render step heading / desc.
+  el("step-tag").textContent = "Step " + (currentStep + 1) + " / " + scenarios[currentScenario].steps.length;
+  el("step-title").textContent = s.title;
+  el("step-desc").textContent = s.desc;
+  el("counter").textContent = (currentStep + 1) + " / " + scenarios[currentScenario].steps.length;
+  // State table.
+  const tbl = el("state-tbl");
+  tbl.innerHTML = "";
+  for (const [k, [v, cls]] of Object.entries(s.state || {})) {
+    const tr = document.createElement("tr");
+    const kd = document.createElement("td"); kd.className = "k"; kd.textContent = k;
+    const vd = document.createElement("td"); vd.className = "v " + (cls || ""); vd.textContent = v;
+    tr.appendChild(kd); tr.appendChild(vd); tbl.appendChild(tr);
+  }
+  // Issue table.
+  const itbl = el("issue-tbl");
+  itbl.innerHTML = "";
+  const row = (k, v, cls) => {
+    const tr = document.createElement("tr");
+    const kd = document.createElement("td"); kd.className = "k"; kd.textContent = k;
+    const vd = document.createElement("td"); vd.className = "v " + (cls || ""); vd.textContent = v;
+    tr.appendChild(kd); tr.appendChild(vd); itbl.appendChild(tr);
+  };
+  row("Scenario", scenarios[currentScenario].label);
+  row("Reviewer issue", scenarios[currentScenario].issue || "(cross-cutting)", scenarios[currentScenario].issue ? "on" : "");
+}
+
+function inferAccent(step) {
+  // Walk state values; the most "severe" class wins.
+  const order = ["danger","warn","on","audit","ok"];
+  let best = "on";
+  for (const [, [, cls]] of Object.entries(step.state || {})) {
+    if (cls && order.indexOf(cls) < order.indexOf(best)) best = cls;
+  }
+  return best;
+}
+
+function renderAll() { renderScenarioTabs(); applyStep(); }
+
+function next() {
+  const s = scenarios[currentScenario].steps;
+  currentStep = (currentStep + 1) % s.length;
+  applyStep();
+}
+function prev() {
+  const s = scenarios[currentScenario].steps;
+  currentStep = (currentStep - 1 + s.length) % s.length;
+  applyStep();
+}
+function reset() { currentStep = 0; stopPlay(); applyStep(); }
+function togglePlay() {
+  if (playing) { stopPlay(); } else { startPlay(); }
+}
+function startPlay() {
+  playing = true;
+  el("btn-play").textContent = "⏸ Pause";
+  playTimer = setInterval(() => {
+    const s = scenarios[currentScenario].steps;
+    if (currentStep === s.length - 1) { stopPlay(); return; }
+    next();
+  }, 1800);
+}
+function stopPlay() {
+  playing = false;
+  el("btn-play").textContent = "▶ Play";
+  if (playTimer) { clearInterval(playTimer); playTimer = null; }
+}
+
+el("btn-prev").onclick = () => { stopPlay(); prev(); };
+el("btn-next").onclick = () => { stopPlay(); next(); };
+el("btn-play").onclick = togglePlay;
+el("btn-reset").onclick = reset;
+
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === " ") { ev.preventDefault(); togglePlay(); }
+  else if (ev.key === "ArrowRight") { stopPlay(); next(); }
+  else if (ev.key === "ArrowLeft") { stopPlay(); prev(); }
+  else if (ev.key === "r" || ev.key === "R") { reset(); }
+});
+
+renderAll();
+</script>
+</body>
+</html>

@@ -17,7 +17,12 @@ multi-process children (`REPLICATOR_PROCESSES=2`) for GIL relief.
 
 ## Reading order
 
-1. **`docs/OVERVIEW.md`** — code-free architecture walkthrough. Start here.
+0. **`docs/design-tour.html`** — interactive single-page tour of the design
+   with step-through scenarios for each of the correctness-critical paths
+   (atomic checkpoint, cross-shard reassembly, LWW race, ingest-DLQ, apply
+   failure + fence). Open the file directly, or view online via
+   [raw.githack](https://rawcdn.githack.com/aws-samples/sample-aurora-dsql-multi-region-async-read-replicas/main/docs/design-tour.html).
+1. **`docs/OVERVIEW.md`** — code-free architecture walkthrough.
 2. **`docs/DESIGN.md`** — the design decisions, with the why and the
    trade-off accepted for each.
 3. **`docs/ARCHITECTURE.md`** — ASCII diagrams, component map, sequence flows.
@@ -34,6 +39,7 @@ multi-process children (`REPLICATOR_PROCESSES=2`) for GIL relief.
 .
 ├── README.md ← you are here
 ├── docs/
+│ ├── design-tour.html ← interactive scenario-by-scenario tour
 │ ├── OVERVIEW.md ← code-free architecture (start here)
 │ ├── DESIGN.md ← design decisions + known limits
 │ ├── ARCHITECTURE.md ← diagrams + sequence flows
