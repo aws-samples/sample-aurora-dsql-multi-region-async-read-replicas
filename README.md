@@ -35,6 +35,7 @@ multi-process children (`REPLICATOR_PROCESSES=2`) for GIL relief.
 ├── README.md ← you are here
 ├── docs/
 │ ├── OVERVIEW.md ← code-free architecture (start here)
+│ ├── DESIGN.md ← design decisions + known limits
 │ ├── ARCHITECTURE.md ← diagrams + sequence flows
 │ └── RUNBOOK.md ← on-call ops guide
 │
@@ -68,7 +69,8 @@ multi-process children (`REPLICATOR_PROCESSES=2`) for GIL relief.
 │ └── replicator_stack.py ← single-stack: VPC + endpoints + NAT + ECR asset +
 │ KMS + 2 SNS topics + 5 alarms + Fargate task + service
 │
-└── loadtest/ ← all load / test tooling + README
+└── loadtest/ ← all load / test tooling (see loadtest/README.md)
+  ├── README.md ← which script for which scenario
   ├── synthetic_publisher.py ← direct Kinesis publisher (full ramp,
   │ chunked, parse / CRC / LWW injection)
   ├── _setup_demo_schema.py ← creates `loadtest_events` on the target
