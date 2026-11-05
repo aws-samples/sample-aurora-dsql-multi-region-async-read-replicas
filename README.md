@@ -120,38 +120,6 @@ Prereq: Docker Desktop running (CDK asset builds the image locally).
 
 ---
 
-## Measured throughput
-
-Cross-region, zero apply errors, no fences opened.
-
-| Shape | Workers / Stripes / vCPU | Target TPS | DMLs/sec |
-|---|---|---|---|
-| Serial lane (baseline) | 32 / 64 / 1 | ~8 | ~27 |
-| Vertical scale | 128 / 256 / 2 | ~24 | ~85 |
-| Vertical push | 256 / 512 / 4 | ~250 | ~870 |
-| Early 2026-10-26 (stripes=512) | 128 / 512 / 8 | ~88 | ~310 |
-| **2026-10-26 after stripe fix** | **128 / 8192 / 8** | **~700** | **~2,400** |
-
-Source side load-tested at 533 TPS for 7 min against the dsql cluster
-`<SOURCE_CLUSTER_ID>.dsql.us-east-1.on.aws` with zero errors, zero
-fences, zero credential rotations lost. The credential-rotation fix
-(commit `6286c6f`) was validated across both the 30-min and the 7-min
-runs. Applier TPS (~700) exceeded the source TPS (~533) and drained
-the ordering buffer backlog from the earlier 30-min run.
-
-### Earlier "88 TPS cap" — a client-side regression, not a server limit
-
-Our 09:xx run claimed a target-DSQL concurrent-write cap. **That was
-wrong.** Per-stage instrumentation (commit `29850a3`) showed the real
-cost was `asyncio.Lock` contention on `APPLIER_STRIPES`. With 128
-workers each acquiring ~7 of only 512 stripes, collision probability
-was ~99 % per queue-position, and `stripe_ms` was 24+ seconds at p95
-despite healthy commit times. Raising `APPLIER_STRIPES` to 8192 dropped
-`stripe_ms` to near zero and lifted the applier from 88 → ~700 TPS.
-Full writeup in `docs/DESIGN.md`.
-
----
-
 ## Known limits
 
 - **`APPLIER_STRIPES` must be ≫ `APPLIER_WORKERS × avg_stripes_per_batch`**
