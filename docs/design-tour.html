@@ -161,11 +161,11 @@
         <text x="290" y="162" text-anchor="middle" class="sub">per-shard worker</text>
       </g>
 
-      <!-- Fragment reassembler (process-global, fix #4) -->
+      <!-- Fragment reassembler (process-global) -->
       <g class="node" id="n-fragment">
         <rect x="220" y="210" width="140" height="80" rx="8"/>
         <text x="290" y="238" text-anchor="middle">FragmentReassembler</text>
-        <text x="290" y="256" text-anchor="middle" class="sub">process-global (fix #4)</text>
+        <text x="290" y="256" text-anchor="middle" class="sub">process-global</text>
         <text x="290" y="272" text-anchor="middle" class="sub">chunk_id → fragments</text>
       </g>
 
@@ -189,7 +189,7 @@
       <g class="node" id="n-tracker">
         <rect x="420" y="320" width="150" height="80" rx="8"/>
         <text x="495" y="348" text-anchor="middle">ShardSeqTracker</text>
-        <text x="495" y="366" text-anchor="middle" class="sub">in_flight / retired (fix #1)</text>
+        <text x="495" y="366" text-anchor="middle" class="sub">in_flight / retired</text>
         <text x="495" y="382" text-anchor="middle" class="sub">per-shard safe seq</text>
       </g>
 
@@ -220,22 +220,22 @@
       <g class="node" id="n-checkpoints">
         <rect x="855" y="234" width="210" height="54" rx="6"/>
         <text x="960" y="256" text-anchor="middle">__replicator_checkpoints</text>
-        <text x="960" y="274" text-anchor="middle" class="sub">per-shard safe seq (fix #1)</text>
+        <text x="960" y="274" text-anchor="middle" class="sub">per-shard safe seq</text>
       </g>
       <g class="node" id="n-late">
         <rect x="855" y="298" width="210" height="54" rx="6"/>
         <text x="960" y="320" text-anchor="middle">__replicator_late_discards</text>
-        <text x="960" y="338" text-anchor="middle" class="sub">LWW audit (fix #5)</text>
+        <text x="960" y="338" text-anchor="middle" class="sub">LWW audit</text>
       </g>
       <g class="node" id="n-dlq-ingest">
         <rect x="855" y="362" width="210" height="54" rx="6"/>
         <text x="960" y="384" text-anchor="middle">__replicator_dlq_ingest</text>
-        <text x="960" y="402" text-anchor="middle" class="sub">parse/CRC/timeout (fix #2)</text>
+        <text x="960" y="402" text-anchor="middle" class="sub">parse / CRC / timeout rejects</text>
       </g>
       <g class="node" id="n-dlq-fence">
         <rect x="855" y="420" width="210" height="40" rx="6"/>
         <text x="960" y="442" text-anchor="middle">__replicator_dlq_fences</text>
-        <text x="960" y="456" text-anchor="middle" class="sub">operational pause (fix #6)</text>
+        <text x="960" y="456" text-anchor="middle" class="sub">operational pause</text>
       </g>
 
       <!-- Edges -->
@@ -426,7 +426,7 @@ const scenarios = {
     topic: "Capturing malformed input",
     steps: [
       { title: "Malformed envelope arrives",
-        desc: "A record on shard 1 fails envelope.parse() — e.g. truncated JSON, a type discriminator that isn't full/chunked/fragment, or a missing required field. The pipeline treats this as something to disposition explicitly: no silent drops, no quiet log-and-skip.",
+        desc: "A record on shard 1 fails envelope.parse() — e.g. truncated JSON, a type discriminator that isn't full/chunked/fragment, or a missing required field. The pipeline treats this as something to disposition explicitly: every malformed input gets a durable record and an operator-visible metric.",
         on: ["n-shard-1","n-parse"], edge: ["e-shards-parse"],
         state: {"Reason": ["parse_error", "warn"], "Raw bytes": ["kept", "warn"]} },
       { title: "Enroll + retire by seq",
