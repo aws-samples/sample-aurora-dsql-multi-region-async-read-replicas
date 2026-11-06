@@ -108,7 +108,7 @@ pytest -q
 ## Deploy
 
 See [`infra/README.md`](./infra/README.md) for prereqs and the end-to-end
-deploy / destroy steps. Short version:
+deploy / destroy steps.
 
 ```bash
 cd infra/
@@ -116,13 +116,55 @@ python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 AWS_REGION=<control-region> .venv/bin/cdk bootstrap
-.venv/bin/cdk deploy \
- -c target_cluster_id=<TARGET_CLUSTER_ID> \
- -c target_region=<target-region> \
- -c target_endpoint_url=https://dsql.<target-region>.api.aws
 ```
 
 Prereq: Docker Desktop running (CDK asset builds the image locally).
+
+The replicator always needs the **target** cluster, plus one of two ways to
+identify the **source** — pick the mode that matches what you already have.
+
+### Mode A — You know the source cluster id
+
+The preferred mode when the source DSQL cluster already exists and has CDC
+enabled. On startup the replicator calls `dsql:ListStreams` + `dsql:GetStream`
+on the source cluster, picks the ACTIVE stream, and reads the Kinesis stream
+ARN out of its CDC configuration — you never type a stream name:
+
+```bash
+.venv/bin/cdk deploy \
+ -c source_cluster_id=<SOURCE_CLUSTER_ID> \
+ -c source_region=<source-region> \
+ -c target_cluster_id=<TARGET_CLUSTER_ID> \
+ -c target_region=<target-region>
+```
+
+If no ACTIVE stream is attached, the preflight fails fast with a clear message
+instead of silently consuming from nothing.
+
+### Mode B — You know the Kinesis stream directly
+
+Use this when CDC was wired up outside this project and you already have the
+stream name — e.g. a shared ingest stream, or a demo scenario where the
+loadtest tooling publishes synthetic records directly to Kinesis:
+
+```bash
+.venv/bin/cdk deploy \
+ -c source_stream_name=<KINESIS_STREAM_NAME> \
+ -c source_region=<source-region> \
+ -c target_cluster_id=<TARGET_CLUSTER_ID> \
+ -c target_region=<target-region>
+```
+
+`source_stream_name` defaults to `dsql-cdc-stream`, so this collapses to
+`-c target_cluster_id=<...> -c target_region=<...>` in the demo scenario.
+
+### Why not infer the source from the target alone?
+
+DSQL has no back-reference from a target cluster to "the cluster whose CDC I'm
+consuming." The two clusters are independent — the replicator is what links
+them. So the operator always names the source somehow: either the **cluster
+id** (Mode A, strongly preferred for production) or the **Kinesis stream**
+(Mode B, for cases where the cluster id is not available).
 
 ---
 

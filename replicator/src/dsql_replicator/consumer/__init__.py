@@ -27,7 +27,6 @@ async def run(cfg: Config) -> None:
     target = DsqlEndpoint(
         hostname=_target_hostname(cfg),
         region=cfg.target_region,
-        endpoint_url=cfg.target_endpoint_url,
         cluster_identifier=cfg.target_cluster_id,
     )
     pipelines = [ConsumerPipeline(cfg, stream_name=s, target_endpoint=target) for s in cfg.source_streams]

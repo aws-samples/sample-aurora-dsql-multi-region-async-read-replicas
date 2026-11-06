@@ -18,7 +18,6 @@ def _set_env(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> None:
         "SOURCE_REGION",
         "TARGET_CLUSTER_ID",
         "TARGET_REGION",
-        "TARGET_ENDPOINT_URL",
         "RESOURCE_PREFIX",
         "SNS_TOPIC_ARN",
         "CONTROL_REGION",

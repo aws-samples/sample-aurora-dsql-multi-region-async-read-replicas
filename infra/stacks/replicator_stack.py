@@ -44,9 +44,9 @@ class DsqlReplicatorStack(cdk.Stack):
         source_region: str,
         target_cluster_id: str,
         target_region: str,
-        target_endpoint_url: str,
         resource_prefix: str,
         dlq_sns_topic_name: str,
+        source_cluster_id: str | None = None,
         alarm_email: str | None = None,
         **kwargs: object,
     ) -> None:
@@ -154,6 +154,17 @@ class DsqlReplicatorStack(cdk.Stack):
             )
         )
 
+        # DSQL control-plane reads: preflight uses these to verify CDC is enabled
+        # on the source cluster and auto-derive the Kinesis stream when the
+        # operator passes `source_cluster_id`. Scoped to the source region only.
+        task_role.add_to_policy(
+            iam.PolicyStatement(
+                sid="DsqlSourcePreflight",
+                actions=["dsql:ListStreams", "dsql:GetStream", "dsql:GetCluster"],
+                resources=[f"arn:aws:dsql:{source_region}:{self.account}:cluster/*"],
+            )
+        )
+
         # State plane now lives in target DSQL — no DynamoDB policy. Fence rows,
         # payloads, checkpoints, shard leases, and watermark mirrors are all in
         # target-DSQL tables bootstrapped by `Applier.start()`. Permission to touch
@@ -242,11 +253,15 @@ class DsqlReplicatorStack(cdk.Stack):
             image=ecs.ContainerImage.from_docker_image_asset(image_asset),
             logging=ecs.LogDrivers.aws_logs(stream_prefix="replicator", log_group=log_group),
             environment={
+                # When SOURCE_CLUSTER_ID is set, the replicator auto-derives
+                # SOURCE_STREAMS from the cluster's CDC config at startup and
+                # ignores the SOURCE_STREAMS passed here (preflight verifies
+                # the two agree if the operator sets both).
                 "SOURCE_STREAMS": source_stream_name,
+                "SOURCE_CLUSTER_ID": source_cluster_id or "",
                 "SOURCE_REGION": source_region,
                 "TARGET_CLUSTER_ID": target_cluster_id,
                 "TARGET_REGION": target_region,
-                "TARGET_ENDPOINT_URL": target_endpoint_url,
                 "RESOURCE_PREFIX": resource_prefix,
                 "DLQ_SNS_TOPIC_NAME": dlq_sns_topic_name,
                 "CONTROL_REGION": source_region,

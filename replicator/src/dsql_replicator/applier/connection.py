@@ -39,7 +39,6 @@ class DsqlEndpoint:
 
     hostname: str
     region: str
-    endpoint_url: str | None = None
     cluster_identifier: str | None = None  # bookkeeping only
 
 
@@ -55,11 +54,8 @@ class DsqlTokenCache:
     def __init__(self, endpoint: DsqlEndpoint, ttl_seconds: float = 600.0) -> None:
         self._endpoint = endpoint
         self._ttl = ttl_seconds
-        kwargs: dict[str, str] = {"region_name": endpoint.region}
-        if endpoint.endpoint_url:
-            kwargs["endpoint_url"] = endpoint.endpoint_url
         # DSQL is not yet in botocore type stubs; fall back to untyped client.
-        self._client = boto3.client("dsql", **kwargs)  # type: ignore[call-overload]
+        self._client = boto3.client("dsql", region_name=endpoint.region)  # type: ignore[call-overload]
         self._token: str | None = None
         self._issued_mono: float = 0.0
         self._lock = asyncio.Lock()

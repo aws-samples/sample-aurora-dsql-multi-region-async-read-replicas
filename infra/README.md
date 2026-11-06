@@ -44,7 +44,6 @@ cd ../replicator/
 SOURCE_STREAMS=dsql-cdc-stream SOURCE_REGION=<source-region> \
   TARGET_CLUSTER_ID=<your-target-cluster-id> \
   TARGET_REGION=<target-region> \
-  TARGET_ENDPOINT_URL=https://dsql.<target-region>.api.aws \
   .venv/bin/dsql-replicator migrate
 ```
 
@@ -54,13 +53,11 @@ SOURCE_STREAMS=dsql-cdc-stream SOURCE_REGION=<source-region> \
 cd infra/
 AWS_REGION=<control-region> .venv/bin/cdk diff \
   -c target_cluster_id=<your-target-cluster-id> \
-  -c target_region=<target-region> \
-  -c target_endpoint_url=https://dsql.<target-region>.api.aws
+  -c target_region=<target-region>
 
 AWS_REGION=<control-region> .venv/bin/cdk deploy \
   -c target_cluster_id=<your-target-cluster-id> \
-  -c target_region=<target-region> \
-  -c target_endpoint_url=https://dsql.<target-region>.api.aws
+  -c target_region=<target-region>
 ```
 
 Watch logs:

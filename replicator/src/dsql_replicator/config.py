@@ -58,11 +58,14 @@ class Config:
     # Source
     source_streams: tuple[str, ...]
     source_region: str
+    # BYO source cluster: if set, the consumer auto-derives source_streams from
+    # the cluster's CDC configuration at startup (see preflight.py). Supplying
+    # this instead of SOURCE_STREAMS also verifies CDC is actually enabled.
+    source_cluster_id: str | None
 
     # Target
     target_cluster_id: str
     target_region: str
-    target_endpoint_url: str | None
 
     # State plane (post-2026-10-12: SNS + CloudWatch only — state is in target DSQL)
     resource_prefix: str
@@ -116,17 +119,22 @@ class Config:
 
     @classmethod
     def from_env(cls) -> Config:
-        source_streams = tuple(s.strip() for s in _required("SOURCE_STREAMS").split(",") if s.strip())
-        if not source_streams:
-            raise ConfigError("SOURCE_STREAMS must contain at least one stream")
+        source_cluster_id = os.environ.get("SOURCE_CLUSTER_ID") or None
+        raw_streams = os.environ.get("SOURCE_STREAMS", "")
+        source_streams = tuple(s.strip() for s in raw_streams.split(",") if s.strip())
+        if not source_streams and not source_cluster_id:
+            raise ConfigError(
+                "either SOURCE_STREAMS or SOURCE_CLUSTER_ID must be set "
+                "(SOURCE_CLUSTER_ID auto-derives the stream from the DSQL cluster's CDC config)"
+            )
 
         source_region = _optional("SOURCE_REGION", "us-east-1")
         return cls(
             source_streams=source_streams,
             source_region=source_region,
+            source_cluster_id=source_cluster_id,
             target_cluster_id=_required("TARGET_CLUSTER_ID"),
             target_region=_required("TARGET_REGION"),
-            target_endpoint_url=os.environ.get("TARGET_ENDPOINT_URL") or None,
             resource_prefix=_optional("RESOURCE_PREFIX", "dsql-replicator"),
             sns_topic_arn=os.environ.get("SNS_TOPIC_ARN") or None,
             control_region=_optional("CONTROL_REGION", source_region),

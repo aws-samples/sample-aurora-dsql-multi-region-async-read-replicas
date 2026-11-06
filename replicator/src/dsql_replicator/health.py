@@ -140,6 +140,5 @@ def _target_endpoint(cfg: Config) -> DsqlEndpoint:
     return DsqlEndpoint(
         hostname=host,
         region=cfg.target_region,
-        endpoint_url=cfg.target_endpoint_url,
         cluster_identifier=cfg.target_cluster_id,
     )
