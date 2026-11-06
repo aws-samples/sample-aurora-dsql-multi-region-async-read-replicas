@@ -163,6 +163,7 @@ class Applier:
         backoff_cap_s: float = 10.0,
         stripe_count: int = 64,
         worker_count: int = 32,
+        max_worker_count: int | None = None,
         _fault_after_rows: int | None = None,
     ) -> None:
         self._endpoint = endpoint
@@ -172,10 +173,19 @@ class Applier:
         self._backoff_cap = backoff_cap_s
         self._stripe_count = max(1, stripe_count)
         self._worker_count = max(1, worker_count)
+        # Autoscale ceiling. The connection pool is sized to this at startup
+        # so grow_pool() can .put() new connections without rebuilding the
+        # queue; stripes must be sized to the ceiling too (see DESIGN.md
+        # STRIPES >= 64 x WORKERS). Defaults to the current count so
+        # callers that don't opt into scaling see identical behavior.
+        self._max_worker_count = max(self._worker_count, max_worker_count or self._worker_count)
         self._stripes: list[asyncio.Lock] = [asyncio.Lock() for _ in range(self._stripe_count)]
         self._conn_pool: asyncio.Queue[psycopg.AsyncConnection[tuple[object, ...]]] = asyncio.Queue(
-            maxsize=self._worker_count
+            maxsize=self._max_worker_count
         )
+        # Serializes grow_pool / shrink_pool so the autoscaler can call them
+        # concurrently with apply traffic without racing on _worker_count.
+        self._pool_resize_lock = asyncio.Lock()
         # Track each pool connection's open time so we can proactively recycle
         # before the IAM token (TTL ~15 min) expires server-side. Without this,
         # the first apply after a 15 min idle period hits dead sockets on every
@@ -222,6 +232,57 @@ class Applier:
         if self._schema_conn is not None and not self._schema_conn.closed:
             await self._schema_conn.close()
         self._schema_conn = None
+
+    # ---- dynamic pool resizing (used by WorkerAutoscaler) ----------------
+
+    @property
+    def worker_count(self) -> int:
+        return self._worker_count
+
+    @property
+    def max_worker_count(self) -> int:
+        return self._max_worker_count
+
+    async def grow_pool(self, delta: int) -> int:
+        """Add up to `delta` fresh connections to the apply pool. Caps at
+        max_worker_count. Returns the number actually added. Safe to call
+        concurrently with apply traffic."""
+        if delta <= 0:
+            return 0
+        async with self._pool_resize_lock:
+            room = self._max_worker_count - self._worker_count
+            to_add = min(delta, room)
+            if to_add <= 0:
+                return 0
+            for _ in range(to_add):
+                conn = await open_connection(self._endpoint, self._token_cache, autocommit=False)
+                self._conn_opened_mono[id(conn)] = time.monotonic()
+                await self._conn_pool.put(conn)
+            self._worker_count += to_add
+            return to_add
+
+    async def shrink_pool(self, delta: int) -> int:
+        """Best-effort shrink: pop up to `delta` connections from the pool
+        and close them. Never blocks: if the pool is drained (all workers
+        busy), returns 0 and the caller should retry next tick."""
+        if delta <= 0 or self._worker_count <= 1:
+            return 0
+        async with self._pool_resize_lock:
+            # Keep at least 1 worker so apply traffic doesn't deadlock.
+            floor_room = self._worker_count - 1
+            to_remove = min(delta, floor_room, self._conn_pool.qsize())
+            removed = 0
+            for _ in range(to_remove):
+                try:
+                    conn = self._conn_pool.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                self._conn_opened_mono.pop(id(conn), None)
+                if not conn.closed:
+                    await conn.close()
+                removed += 1
+            self._worker_count -= removed
+            return removed
 
     async def _borrow_fresh_conn(self) -> psycopg.AsyncConnection[tuple[object, ...]]:
         """Pop a connection from the pool; if its token is near expiry, recycle it.

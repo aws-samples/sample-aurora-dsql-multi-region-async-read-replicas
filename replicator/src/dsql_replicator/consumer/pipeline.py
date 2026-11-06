@@ -54,6 +54,7 @@ import psycopg
 import structlog
 
 from dsql_replicator.applier import Applier, ApplyError
+from dsql_replicator.applier.autoscaler import AutoscaleParams, WorkerAutoscaler
 from dsql_replicator.applier.connection import DsqlEndpoint, DsqlTokenCache, open_connection
 from dsql_replicator.config import Config
 from dsql_replicator.dlq import DlqWriter
@@ -99,6 +100,7 @@ class ConsumerPipeline:
             backoff_initial_s=cfg.apply_backoff_initial_ms / 1000.0,
             stripe_count=cfg.applier_stripes,
             worker_count=cfg.applier_workers,
+            max_worker_count=cfg.applier_workers_max or cfg.applier_workers,
         )
         self._dlq = DlqWriter(cfg, target_endpoint)
         self._fence_poll_interval_s = cfg.fence_poll_interval_ms / 1000.0
@@ -222,6 +224,22 @@ class ConsumerPipeline:
                     self._shard_discovery_loop(kinesis, worker_tasks),
                     name="shard-discovery",
                 )
+                autoscaler = WorkerAutoscaler(
+                    applier=self._applier,
+                    lag_ms_signal=self._current_lag_ms,
+                    params=AutoscaleParams(
+                        floor=self._cfg.applier_workers,
+                        ceiling=self._cfg.applier_workers_max or self._cfg.applier_workers,
+                        step=self._cfg.applier_scale_step,
+                        tick_s=self._cfg.applier_scale_tick_ms / 1000.0,
+                        scale_up_lag_ms=float(self._cfg.applier_scale_up_lag_ms),
+                        scale_up_sustain_s=self._cfg.applier_scale_up_sustain_ms / 1000.0,
+                        scale_down_lag_ms=float(self._cfg.applier_scale_down_lag_ms),
+                        scale_down_sustain_s=self._cfg.applier_scale_down_sustain_ms / 1000.0,
+                    ),
+                    stop_event=self._stop,
+                )
+                autoscaler_task = asyncio.create_task(autoscaler.run(), name="writer-autoscaler")
                 try:
                     await self._stop.wait()
                 finally:
@@ -232,6 +250,7 @@ class ConsumerPipeline:
                     metrics_task.cancel()
                     sweep_task.cancel()
                     discovery_task.cancel()
+                    autoscaler_task.cancel()
                     await asyncio.gather(
                         *worker_tasks.values(),
                         runner_task,
@@ -239,6 +258,7 @@ class ConsumerPipeline:
                         metrics_task,
                         sweep_task,
                         discovery_task,
+                        autoscaler_task,
                         return_exceptions=True,
                     )
         finally:
@@ -268,6 +288,16 @@ class ConsumerPipeline:
 
     def stop(self) -> None:
         self._stop.set()
+
+    def _current_lag_ms(self) -> float | None:
+        """Writer autoscaler signal: wall-time age of the ordering buffer's
+        committed watermark. Same quantity emitted as the WatermarkLagMs
+        CloudWatch metric, read in-process so the scaler doesn't round-trip
+        through CloudWatch. Returns None before the first watermark advance."""
+        stats = self._ordering.stats()
+        if stats.watermark_ns is None:
+            return None
+        return max(0.0, (time.time_ns() - stats.watermark_ns) / 1e6)
 
     # ---- shard discovery ------------------------------------------------
 

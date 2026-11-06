@@ -270,10 +270,16 @@ class DsqlReplicatorStack(cdk.Stack):
                 # concurrent apply lanes to target = 256 (same as prior single-proc).
                 "REPLICATOR_PROCESSES": "2",
                 "APPLIER_WORKERS": "128",
-                # STRIPES must dwarf APPLIER_WORKERS * stripes-per-batch, else
-                # workers queue on asyncio stripe locks and CPU stays ~2 %. See
+                # Autoscale ceiling. Writer pool grows 128 → 256 when
+                # end-to-end lag exceeds 10s for 60s; shrinks back on 2s/5min.
+                # Set equal to APPLIER_WORKERS to disable scaling.
+                "APPLIER_WORKERS_MAX": "256",
+                # STRIPES must dwarf APPLIER_WORKERS_MAX * stripes-per-batch
+                # (the ceiling, not the floor), else once the autoscaler grows
+                # the pool past 128 workers they queue on asyncio stripe locks
+                # and CPU stays ~2%. 16384 = 64 × 256-worker ceiling. See the
                 # 2026-10-26 stripe-contention finding in docs/DESIGN.md.
-                "APPLIER_STRIPES": "8192",
+                "APPLIER_STRIPES": "16384",
                 # Micro-batching (A): 2 source txns per cross-region commit, flush
                 # partial batches after 50 ms. Larger values (16) measured 2026-10-26
                 # produced ~50 stripes/batch which near-fully serialized on stripe

@@ -109,6 +109,17 @@ class Config:
     applier_stripes: int
     applier_workers: int
 
+    # Writer autoscaling: start at `applier_workers` (floor), grow to
+    # `applier_workers_max` on sustained lag, shrink back on recovery.
+    # Set applier_workers_max <= applier_workers to disable autoscaling.
+    applier_workers_max: int
+    applier_scale_step: int
+    applier_scale_tick_ms: int
+    applier_scale_up_lag_ms: int
+    applier_scale_up_sustain_ms: int
+    applier_scale_down_lag_ms: int
+    applier_scale_down_sustain_ms: int
+
     # Micro-batching (A): pack multiple source txns into one target BEGIN...COMMIT.
     # Size-or-time flush. One cross-region commit amortizes N source txns' RTT.
     batch_max_txns: int
@@ -164,6 +175,13 @@ class Config:
             shard_discovery_interval_ms=_int("SHARD_DISCOVERY_INTERVAL_MS", 300_000),
             applier_stripes=_int("APPLIER_STRIPES", 64),
             applier_workers=_int("APPLIER_WORKERS", 32),
+            applier_workers_max=_int("APPLIER_WORKERS_MAX", 0),
+            applier_scale_step=_int("APPLIER_SCALE_STEP", 32),
+            applier_scale_tick_ms=_int("APPLIER_SCALE_TICK_MS", 10_000),
+            applier_scale_up_lag_ms=_int("APPLIER_SCALE_UP_LAG_MS", 10_000),
+            applier_scale_up_sustain_ms=_int("APPLIER_SCALE_UP_SUSTAIN_MS", 60_000),
+            applier_scale_down_lag_ms=_int("APPLIER_SCALE_DOWN_LAG_MS", 2_000),
+            applier_scale_down_sustain_ms=_int("APPLIER_SCALE_DOWN_SUSTAIN_MS", 300_000),
             batch_max_txns=_int("BATCH_MAX_TXNS", 16),
             batch_max_wait_ms=_int("BATCH_MAX_WAIT_MS", 50),
             replicator_processes=_int("REPLICATOR_PROCESSES", 1),
