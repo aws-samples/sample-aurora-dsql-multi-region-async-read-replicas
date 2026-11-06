@@ -22,6 +22,9 @@ multi-process children (`REPLICATOR_PROCESSES=2`) for GIL relief.
    (atomic checkpoint, cross-shard reassembly, LWW race, ingest-DLQ, apply
    failure + fence). Open the file directly, or view online via
    [raw.githack](https://rawcdn.githack.com/aws-samples/sample-aurora-dsql-multi-region-async-read-replicas/main/docs/design-tour.html).
+0a. **`docs/DEPLOY.md`** — the single page an operator reads to go from clone
+   to replicating. Prereqs → CDC enablement → bootstrap → both deploy modes →
+   verify → teardown → troubleshooting.
 1. **`docs/OVERVIEW.md`** — code-free architecture walkthrough.
 2. **`docs/DESIGN.md`** — the design decisions, with the why and the
    trade-off accepted for each.
@@ -40,6 +43,7 @@ multi-process children (`REPLICATOR_PROCESSES=2`) for GIL relief.
 ├── README.md ← you are here
 ├── docs/
 │ ├── design-tour.html ← interactive scenario-by-scenario tour
+│ ├── DEPLOY.md ← day-one deploy: clone → replicating, one page
 │ ├── OVERVIEW.md ← code-free architecture (start here)
 │ ├── DESIGN.md ← design decisions + known limits
 │ ├── ARCHITECTURE.md ← diagrams + sequence flows
@@ -107,8 +111,12 @@ pytest -q
 
 ## Deploy
 
-See [`infra/README.md`](./infra/README.md) for prereqs and the end-to-end
-deploy / destroy steps.
+> **➡️ Full end-to-end deployment guide: [`docs/DEPLOY.md`](./docs/DEPLOY.md)** —
+> single page, clone to replicating in ~20 minutes. Covers prereqs, DSQL CDC
+> enablement, workspace setup, state-plane bootstrap, both deploy modes,
+> traffic generation, verification, teardown, and troubleshooting.
+
+Short version (clone + bootstrap + deploy):
 
 ```bash
 cd infra/
@@ -116,21 +124,6 @@ python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 AWS_REGION=<control-region> .venv/bin/cdk bootstrap
-```
-
-Prereq: Docker Desktop running (CDK asset builds the image locally).
-
-The replicator always needs the **target** cluster, plus one of two ways to
-identify the **source** — pick the mode that matches what you already have.
-
-### Mode A — You know the source cluster id
-
-The preferred mode when the source DSQL cluster already exists and has CDC
-enabled. On startup the replicator calls `dsql:ListStreams` + `dsql:GetStream`
-on the source cluster, picks the ACTIVE stream, and reads the Kinesis stream
-ARN out of its CDC configuration — you never type a stream name:
-
-```bash
 .venv/bin/cdk deploy \
  -c source_cluster_id=<SOURCE_CLUSTER_ID> \
  -c source_region=<source-region> \
@@ -138,33 +131,12 @@ ARN out of its CDC configuration — you never type a stream name:
  -c target_region=<target-region>
 ```
 
-If no ACTIVE stream is attached, the preflight fails fast with a clear message
-instead of silently consuming from nothing.
+Two modes for naming the source are available — `source_cluster_id` (preflight
+auto-derives the Kinesis stream from the cluster's CDC config) or
+`source_stream_name` (consume a Kinesis stream directly). See
+[`docs/DEPLOY.md`](./docs/DEPLOY.md) for which to pick and why.
 
-### Mode B — You know the Kinesis stream directly
-
-Use this when CDC was wired up outside this project and you already have the
-stream name — e.g. a shared ingest stream, or a demo scenario where the
-loadtest tooling publishes synthetic records directly to Kinesis:
-
-```bash
-.venv/bin/cdk deploy \
- -c source_stream_name=<KINESIS_STREAM_NAME> \
- -c source_region=<source-region> \
- -c target_cluster_id=<TARGET_CLUSTER_ID> \
- -c target_region=<target-region>
-```
-
-`source_stream_name` defaults to `dsql-cdc-stream`, so this collapses to
-`-c target_cluster_id=<...> -c target_region=<...>` in the demo scenario.
-
-### Why not infer the source from the target alone?
-
-DSQL has no back-reference from a target cluster to "the cluster whose CDC I'm
-consuming." The two clusters are independent — the replicator is what links
-them. So the operator always names the source somehow: either the **cluster
-id** (Mode A, strongly preferred for production) or the **Kinesis stream**
-(Mode B, for cases where the cluster id is not available).
+Prereq: Docker Desktop running (CDK builds the image locally).
 
 ---
 
