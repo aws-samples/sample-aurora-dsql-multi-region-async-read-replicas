@@ -100,6 +100,11 @@ class Config:
     # Observability (M5)
     metrics_interval_ms: int
 
+    # Shard discovery: how often to re-list Kinesis shards after startup so
+    # that mid-run resharding (e.g. 10 shards → 12 shards) is picked up
+    # without a task restart. Set to 0 to disable periodic re-discovery.
+    shard_discovery_interval_ms: int
+
     # Per-key parallel apply (M6.0)
     applier_stripes: int
     applier_workers: int
@@ -156,6 +161,7 @@ class Config:
             lease_heartbeat_seconds=_int("LEASE_HEARTBEAT_SECONDS", 10),
             lease_steal_scan_seconds=_int("LEASE_STEAL_SCAN_SECONDS", 30),
             metrics_interval_ms=_int("METRICS_INTERVAL_MS", 10_000),
+            shard_discovery_interval_ms=_int("SHARD_DISCOVERY_INTERVAL_MS", 300_000),
             applier_stripes=_int("APPLIER_STRIPES", 64),
             applier_workers=_int("APPLIER_WORKERS", 32),
             batch_max_txns=_int("BATCH_MAX_TXNS", 16),

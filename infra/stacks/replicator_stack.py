@@ -281,6 +281,10 @@ class DsqlReplicatorStack(cdk.Stack):
                 # stripes/batch at ~7, which plays well with APPLIER_STRIPES=8192.
                 "BATCH_MAX_TXNS": "2",
                 "BATCH_MAX_WAIT_MS": "50",
+                # Re-list Kinesis shards every 5 min so a mid-run reshard
+                # (e.g. 10 → 12 shards) is picked up without rolling the task.
+                # Set to "0" to disable periodic re-discovery.
+                "SHARD_DISCOVERY_INTERVAL_MS": "300000",
             },
             health_check=ecs.HealthCheck(
                 command=["CMD-SHELL", "dsql-replicator healthz || exit 1"],

@@ -204,28 +204,41 @@ class ConsumerPipeline:
                     shards=len(shards),
                     target_cluster=self._target.cluster_identifier,
                 )
-                worker_tasks = [
-                    asyncio.create_task(self._shard_worker(kinesis, s), name=f"shard:{s}") for s in shards
-                ]
+                # Dict so the discovery loop can diff "shards seen now" against
+                # "shards we've already spawned workers for" and only start
+                # tasks for new shards. Reusing the same spawn path for
+                # startup and for mid-run resharding keeps the invariant that
+                # every worker goes through _try_lease — so if two processes
+                # discover a new shard at the same time, only one applies it.
+                worker_tasks: dict[str, asyncio.Task[None]] = {
+                    s: asyncio.create_task(self._shard_worker(kinesis, s), name=f"shard:{s}")
+                    for s in shards
+                }
                 runner_task = asyncio.create_task(self._apply_runner(), name="apply-runner")
                 fence_task = asyncio.create_task(self._fence_poller(), name="fence-poller")
                 metrics_task = asyncio.create_task(self._metrics_loop(), name="metrics-loop")
                 sweep_task = asyncio.create_task(self._reassembly_sweeper(), name="reassembly-sweeper")
+                discovery_task = asyncio.create_task(
+                    self._shard_discovery_loop(kinesis, worker_tasks),
+                    name="shard-discovery",
+                )
                 try:
                     await self._stop.wait()
                 finally:
-                    for t in worker_tasks:
+                    for t in worker_tasks.values():
                         t.cancel()
                     runner_task.cancel()
                     fence_task.cancel()
                     metrics_task.cancel()
                     sweep_task.cancel()
+                    discovery_task.cancel()
                     await asyncio.gather(
-                        *worker_tasks,
+                        *worker_tasks.values(),
                         runner_task,
                         fence_task,
                         metrics_task,
                         sweep_task,
+                        discovery_task,
                         return_exceptions=True,
                     )
         finally:
@@ -274,6 +287,60 @@ class ConsumerPipeline:
         if not shards:
             raise ReplicatorError(f"stream {self._stream_name} has no shards")
         return shards
+
+    async def _shard_discovery_loop(
+        self, kinesis: Any, worker_tasks: dict[str, asyncio.Task[None]]
+    ) -> None:
+        """Periodically re-list Kinesis shards and spawn workers for new ones.
+
+        Protects against mid-run resharding (10 shards → 12 shards) silently
+        dropping records on the new shards until the task restarts. Workers
+        for closed/split shards exit on end-of-shard naturally; we prune
+        their entries so the dict only tracks live tasks.
+
+        A completed-not-cancelled entry is also pruned: if a shard we
+        previously saw stops being leased by anyone and the local worker
+        returned, this loop will respawn it next poll and let the lease
+        logic re-decide ownership.
+        """
+        interval_s = self._cfg.shard_discovery_interval_ms / 1000.0
+        if interval_s <= 0:
+            log.info("shard.discovery.disabled", stream=self._stream_name)
+            return
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=interval_s)
+                return  # stop was set during the wait
+            except asyncio.TimeoutError:
+                pass  # interval elapsed, poll
+            try:
+                discovered = set(await self._list_shards(kinesis))
+            except Exception as exc:
+                # list_shards failures are transient (throttling, cold boto client).
+                # Log and try again next cycle; existing workers keep running.
+                log.warning(
+                    "shard.discovery.list_failed",
+                    stream=self._stream_name,
+                    error=str(exc),
+                )
+                continue
+
+            # Prune workers that have finished (closed shard or lease loss).
+            for sid in [s for s, t in worker_tasks.items() if t.done()]:
+                worker_tasks.pop(sid, None)
+
+            new_shards = discovered - worker_tasks.keys()
+            if new_shards:
+                log.info(
+                    "shard.discovery.new",
+                    stream=self._stream_name,
+                    new_shards=sorted(new_shards),
+                    live_shards=sorted(worker_tasks.keys()),
+                )
+                for sid in sorted(new_shards):
+                    worker_tasks[sid] = asyncio.create_task(
+                        self._shard_worker(kinesis, sid), name=f"shard:{sid}"
+                    )
 
     # ---- per-shard worker -----------------------------------------------
 
