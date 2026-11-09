@@ -201,10 +201,12 @@ python synthetic_publisher.py \
 **CloudWatch dashboard** (upserted by `migrate` in step 4):
 
 Open the AWS console → CloudWatch → Dashboards → `dsql-replicator`. The
-important panels are *Apply TPS*, *End-to-end lag*, *Open fence*, *Ordering
-buffer depth*, and *Kinesis records-behind-latest*. Lag should land in the
-low seconds under steady state; apply TPS should match the source
-production rate.
+important panels are *Apply queue depth*, *Replication lag (ms)*,
+*Throughput* (RecordsReceived / ApplyBatches / RowsApplied / RowsDiscarded),
+and *Kinesis records-behind-latest*. Under steady state, the apply queue
+should stay near zero and replication lag should sit in the low seconds.
+`RowsDiscarded` ticking non-zero is normal — it counts late-arriving older
+commits that the LWW stamp correctly rejected.
 
 **Target-side spot check** — connect to the target DSQL cluster and
 confirm rows are arriving:
@@ -249,12 +251,23 @@ reset state:
 
 ```sql
 DROP TABLE IF EXISTS
-  __replicator_fence,
-  __replicator_dlq_payloads,
-  __replicator_checkpoints,
-  __replicator_shard_leases,
   __replicator_lww_stamps,
-  __replicator_watermarks;
+  __replicator_checkpoints,
+  __replicator_shard_leases;
+```
+
+If you are tearing down a pre-2026-11 deploy, also drop the obsolete
+tables so the schema is clean:
+
+```sql
+DROP TABLE IF EXISTS
+  __replicator_applied,
+  __replicator_applied_v2,
+  __replicator_late_discards,
+  __replicator_dlq_fences,
+  __replicator_dlq_payload,
+  __replicator_dlq_ingest,
+  __replicator_watermark_state;
 ```
 
 Likewise, the DSQL CDC stream on the source cluster is **not** disabled by
@@ -272,7 +285,7 @@ followed by `aws kinesis delete-stream --stream-name <name>`.
 | Preflight: `SOURCE_STREAMS=[...] disagrees with the streams attached to SOURCE_CLUSTER_ID` | Explicit SOURCE_STREAMS conflicts with the derived set | Drop `-c source_stream_name=…` so Mode A auto-derives, or correct it to match |
 | Fargate task flapping, `healthz` failing | Target DSQL unreachable, or state tables missing | Re-run `dsql-replicator migrate`; check VPC endpoints in the control region |
 | Lag growing unbounded | Source TPS exceeds applier shape | See `docs/DESIGN.md` → stripe-contention and APPLIER_WORKERS/STRIPES rule of thumb |
-| Open-fence alarm firing | Apply failure → DLQ-fence opened | `docs/RUNBOOK.md` → *Open fence* decision tree |
+| `ReplicationLag` + `ApplyQueueNearCap` both firing | Persistent apply failure on a hot key (schema drift, FK violation) | `docs/RUNBOOK.md` → §5 *Persistent apply failure* |
 
 For deeper issues, start with the on-call guide:
 [`docs/RUNBOOK.md`](./RUNBOOK.md).

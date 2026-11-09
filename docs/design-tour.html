@@ -99,8 +99,10 @@
   <div>
     <h1>DSQL CDC Replicator — Design Tour</h1>
     <div class="lede">
-      Interactive walk through the pipeline's correctness-critical paths.
-      Pick a scenario, step through it, watch the state panel.
+      Interactive walk through the pipeline's row-level LWW correctness
+      paths. Pick a scenario, step through it, watch the state panel.
+      See the README's "Row-level eventual consistency" section for the
+      authoritative semantics.
     </div>
   </div>
   <div class="tag">aws-samples / sample-aurora-dsql-multi-region-async-read-replicas</div>
@@ -113,7 +115,7 @@
   <span class="chip"><span class="sw ok"></span>applied / safe</span>
   <span class="chip"><span class="sw warn"></span>reroute / timeout</span>
   <span class="chip"><span class="sw danger"></span>failure / halt</span>
-  <span class="chip"><span class="sw audit"></span>audit / LWW discard</span>
+  <span class="chip"><span class="sw audit"></span>LWW discard (older ts_ns)</span>
 </div>
 
 <div class="board">
@@ -163,42 +165,26 @@
 
       <!-- Fragment reassembler (process-global) -->
       <g class="node" id="n-fragment">
-        <rect x="220" y="210" width="140" height="80" rx="8"/>
-        <text x="290" y="238" text-anchor="middle">FragmentReassembler</text>
-        <text x="290" y="256" text-anchor="middle" class="sub">process-global</text>
-        <text x="290" y="272" text-anchor="middle" class="sub">chunk_id → fragments</text>
+        <rect x="220" y="230" width="140" height="80" rx="8"/>
+        <text x="290" y="258" text-anchor="middle">FragmentReassembler</text>
+        <text x="290" y="276" text-anchor="middle" class="sub">process-global</text>
+        <text x="290" y="292" text-anchor="middle" class="sub">&gt;1 MB rows only</text>
       </g>
 
-      <!-- Txn reassembler (process-global) -->
-      <g class="node" id="n-txn">
-        <rect x="220" y="320" width="140" height="80" rx="8"/>
-        <text x="290" y="348" text-anchor="middle">TransactionReassembler</text>
-        <text x="290" y="366" text-anchor="middle" class="sub">process-global</text>
-        <text x="290" y="382" text-anchor="middle" class="sub">tx_id → records</text>
-      </g>
-
-      <!-- Ordering buffer -->
-      <g class="node" id="n-ordering">
-        <rect x="420" y="210" width="150" height="80" rx="8"/>
-        <text x="495" y="238" text-anchor="middle">OrderingBuffer</text>
-        <text x="495" y="256" text-anchor="middle" class="sub">heap by ts_ns</text>
-        <text x="495" y="272" text-anchor="middle" class="sub">watermark + fence gate</text>
-      </g>
-
-      <!-- Seq tracker -->
-      <g class="node" id="n-tracker">
-        <rect x="420" y="320" width="150" height="80" rx="8"/>
-        <text x="495" y="348" text-anchor="middle">ShardSeqTracker</text>
-        <text x="495" y="366" text-anchor="middle" class="sub">in_flight / retired</text>
-        <text x="495" y="382" text-anchor="middle" class="sub">per-shard safe seq</text>
+      <!-- Apply queue -->
+      <g class="node" id="n-queue">
+        <rect x="420" y="230" width="150" height="80" rx="8"/>
+        <text x="495" y="258" text-anchor="middle">apply queue</text>
+        <text x="495" y="276" text-anchor="middle" class="sub">bounded FIFO</text>
+        <text x="495" y="292" text-anchor="middle" class="sub">shard→apply handoff</text>
       </g>
 
       <!-- Applier -->
       <g class="node" id="n-applier">
-        <rect x="620" y="210" width="160" height="80" rx="8"/>
-        <text x="700" y="238" text-anchor="middle">Applier</text>
-        <text x="700" y="256" text-anchor="middle" class="sub">stripe-locked parallel</text>
-        <text x="700" y="272" text-anchor="middle" class="sub">BEGIN..pre_commit..COMMIT</text>
+        <rect x="620" y="230" width="160" height="80" rx="8"/>
+        <text x="700" y="258" text-anchor="middle">Applier (LWW)</text>
+        <text x="700" y="276" text-anchor="middle" class="sub">stripe-locked parallel</text>
+        <text x="700" y="292" text-anchor="middle" class="sub">infinite retry</text>
       </g>
 
       <!-- Target DSQL + sub-tables -->
@@ -208,53 +194,36 @@
         <text x="960" y="78" text-anchor="middle" class="sub">cross-region</text>
       </g>
       <g class="node" id="n-rows">
-        <rect x="855" y="100" width="210" height="60" rx="6"/>
-        <text x="960" y="124" text-anchor="middle">application tables</text>
-        <text x="960" y="142" text-anchor="middle" class="sub">user rows (INSERT/UPSERT/DELETE)</text>
+        <rect x="855" y="140" width="210" height="60" rx="6"/>
+        <text x="960" y="164" text-anchor="middle">application tables</text>
+        <text x="960" y="182" text-anchor="middle" class="sub">user rows (INSERT/UPSERT/DELETE)</text>
       </g>
       <g class="node" id="n-applied">
-        <rect x="855" y="170" width="210" height="54" rx="6"/>
-        <text x="960" y="192" text-anchor="middle">__replicator_applied_v2</text>
-        <text x="960" y="210" text-anchor="middle" class="sub">per-key LWW stamp</text>
+        <rect x="855" y="220" width="210" height="60" rx="6"/>
+        <text x="960" y="246" text-anchor="middle">__replicator_lww_stamps</text>
+        <text x="960" y="264" text-anchor="middle" class="sub">per-key LWW stamp</text>
       </g>
       <g class="node" id="n-checkpoints">
-        <rect x="855" y="234" width="210" height="54" rx="6"/>
-        <text x="960" y="256" text-anchor="middle">__replicator_checkpoints</text>
-        <text x="960" y="274" text-anchor="middle" class="sub">per-shard safe seq</text>
+        <rect x="855" y="300" width="210" height="60" rx="6"/>
+        <text x="960" y="326" text-anchor="middle">__replicator_checkpoints</text>
+        <text x="960" y="344" text-anchor="middle" class="sub">per-shard resume seq</text>
       </g>
-      <g class="node" id="n-late">
-        <rect x="855" y="298" width="210" height="54" rx="6"/>
-        <text x="960" y="320" text-anchor="middle">__replicator_late_discards</text>
-        <text x="960" y="338" text-anchor="middle" class="sub">LWW audit</text>
-      </g>
-      <g class="node" id="n-dlq-ingest">
-        <rect x="855" y="362" width="210" height="54" rx="6"/>
-        <text x="960" y="384" text-anchor="middle">__replicator_dlq_ingest</text>
-        <text x="960" y="402" text-anchor="middle" class="sub">parse / CRC / timeout rejects</text>
-      </g>
-      <g class="node" id="n-dlq-fence">
-        <rect x="855" y="420" width="210" height="40" rx="6"/>
-        <text x="960" y="442" text-anchor="middle">__replicator_dlq_fences</text>
-        <text x="960" y="456" text-anchor="middle" class="sub">operational pause</text>
+      <g class="node" id="n-leases">
+        <rect x="855" y="380" width="210" height="60" rx="6"/>
+        <text x="960" y="406" text-anchor="middle">__replicator_shard_leases</text>
+        <text x="960" y="424" text-anchor="middle" class="sub">single-writer per shard</text>
       </g>
 
       <!-- Edges -->
       <path id="e-shards-parse" class="edge" d="M 150 134 C 180 134, 190 140, 220 140" marker-end="url(#ah)"/>
-      <path id="e-parse-fragment" class="edge" d="M 290 180 L 290 210" marker-end="url(#ah)"/>
-      <path id="e-fragment-txn" class="edge" d="M 290 290 L 290 320" marker-end="url(#ah)"/>
-      <path id="e-txn-ordering" class="edge" d="M 360 360 C 390 360, 390 250, 420 250" marker-end="url(#ah)"/>
-      <path id="e-ordering-applier" class="edge" d="M 570 250 L 620 250" marker-end="url(#ah)"/>
-      <path id="e-applier-rows" class="edge" d="M 780 240 C 820 240, 820 130, 855 130" marker-end="url(#ah)"/>
-      <path id="e-applier-applied" class="edge" d="M 780 250 C 820 250, 820 197, 855 197" marker-end="url(#ah)"/>
-      <path id="e-applier-ckpt" class="edge" d="M 780 260 C 820 260, 820 261, 855 261" marker-end="url(#ah)"/>
-      <path id="e-applier-late" class="edge" d="M 780 275 C 820 275, 820 325, 855 325" marker-end="url(#ah)"/>
-      <!-- From parse / sweepers to dlq_ingest -->
-      <path id="e-parse-dlq" class="edge" d="M 360 150 C 500 150, 700 150, 855 388" marker-end="url(#ah)"/>
-      <!-- From applier to fence (open on apply error) -->
-      <path id="e-applier-fence" class="edge" d="M 780 290 C 820 290, 820 440, 855 440" marker-end="url(#ah)"/>
-      <!-- Seq tracker touches parse (enroll) and applier (retire+upsert) -->
-      <path id="e-parse-tracker" class="edge" d="M 290 180 C 320 230, 390 360, 420 360" marker-end="url(#ah)"/>
-      <path id="e-tracker-applier" class="edge" d="M 570 360 C 600 360, 620 300, 640 290" marker-end="url(#ah)"/>
+      <path id="e-parse-fragment" class="edge" d="M 290 180 L 290 230" marker-end="url(#ah)"/>
+      <path id="e-parse-queue" class="edge" d="M 360 150 C 390 150, 395 268, 420 268" marker-end="url(#ah)"/>
+      <path id="e-fragment-queue" class="edge" d="M 360 270 L 420 270" marker-end="url(#ah)"/>
+      <path id="e-queue-applier" class="edge" d="M 570 270 L 620 270" marker-end="url(#ah)"/>
+      <path id="e-applier-rows" class="edge" d="M 780 260 C 820 260, 820 170, 855 170" marker-end="url(#ah)"/>
+      <path id="e-applier-applied" class="edge" d="M 780 270 C 820 270, 820 250, 855 250" marker-end="url(#ah)"/>
+      <path id="e-applier-ckpt" class="edge" d="M 780 285 C 820 285, 820 330, 855 330" marker-end="url(#ah)"/>
+      <path id="e-leases-shards" class="edge" d="M 855 410 C 400 410, 180 410, 150 410" marker-end="url(#ah)"/>
     </svg>
   </div>
 
@@ -286,8 +255,7 @@
 </div>
 
 <footer>
-  Load-test numbers (30-min run at 50 TPS, 4 shards): 15,392 txns applied, 410 ingest-side rejects routed, 0 txn timeouts across 5,506 cross-shard chunked txns, 0 apply errors, 3,239 atomic checkpoint upserts.
-  Design detail in <a href="DESIGN.md">docs/DESIGN.md</a>. Source: <a href="https://github.com/aws-samples/sample-aurora-dsql-multi-region-async-read-replicas">aws-samples/sample-aurora-dsql-multi-region-async-read-replicas</a>.
+  Post-2026-11 simplification: cross-shard transaction reassembly, the ordering buffer, the DLQ fence, and the ingest-reject DLQ were removed in favor of row-level LWW only. Kinesis does not preserve DSQL transaction order across shards, so that machinery was selling a guarantee it never delivered. See the README's "Row-level eventual consistency" section and DESIGN §1a for the current contract. Source: <a href="https://github.com/aws-samples/sample-aurora-dsql-multi-region-async-read-replicas">aws-samples/sample-aurora-dsql-multi-region-async-read-replicas</a>.
 </footer>
 </main>
 
@@ -300,18 +268,18 @@
 const scenarios = {
   "overview": {
     label: "Overview",
-    topic: "Topology",
+    topic: "Topology (row-level LWW)",
     steps: [
       {
         title: "At rest",
-        desc: "The replicator runs as one process with one coroutine per Kinesis shard. Shard workers parse envelopes and feed TWO process-global reassemblers — one for chunked records' fragments, one for multi-record transactions. 'Process-global' because DSQL CDC distributes a single transaction's records (and a single chunked record's fragments) across any open shard; a per-shard reassembler would never see the pieces it needs. Once a transaction is fully assembled it enters the OrderingBuffer, which releases by source.ts_ns gated by a watermark + optional DLQ fence. The applier commits each batch in ONE target DSQL BEGIN..COMMIT; inside that commit it writes the user rows, the per-key LWW stamp, the per-shard checkpoint, and any late-discard audit rows — all four atomic. Walk a scenario to see this flow in motion.",
-        on: ["n-kinesis","n-shard-0","n-shard-1","n-shard-2","n-shard-3","n-parse","n-fragment","n-txn","n-ordering","n-tracker","n-applier","n-target","n-rows","n-applied","n-checkpoints","n-late","n-dlq-ingest","n-dlq-fence"],
+        desc: "The replicator runs as one process with one coroutine per Kinesis shard. Shard workers parse envelopes and feed a process-global FragmentReassembler (needed only for >1 MB rows that DSQL CDC splits across shards). Full records bypass the reassembler and land directly on a shared, bounded apply queue. Apply workers drain the queue in micro-batches, acquire stripe locks for the touched primary keys, and commit each batch in ONE target DSQL BEGIN..COMMIT: inside that commit they bump the per-key LWW stamp (gated by WHERE EXCLUDED.applied_ts_ns > existing.applied_ts_ns), run the row DML if the stamp advanced, and upsert the per-shard Kinesis checkpoint — all three atomic. The applier retries transient DSQL failures forever with exponential backoff; there is no fence. Pick a scenario to see this flow in motion.",
+        on: ["n-kinesis","n-shard-0","n-shard-1","n-shard-2","n-shard-3","n-parse","n-fragment","n-queue","n-applier","n-target","n-rows","n-applied","n-checkpoints","n-leases"],
         state: {
           "Mode": ["Idle", ""],
           "Shards registered": ["4", "ok"],
-          "In-flight txns": ["0", ""],
-          "Watermark": ["unset", ""],
-          "Fence": ["none", "ok"],
+          "Apply queue depth": ["0", "ok"],
+          "Replication lag": ["unset", ""],
+          "Consistency": ["row-level eventual", "ok"],
         }
       }
     ]
@@ -322,148 +290,125 @@ const scenarios = {
     topic: "End-to-end commit",
     steps: [
       { title: "Record arrives on shard 2",
-        desc: "A full-record envelope lands in Kinesis shard 2. The shard worker's GetRecords call returns it along with the Kinesis sequence number (an opaque, ever-increasing string per shard). Nothing durable has moved yet; the stored checkpoint is still at its last-committed value.",
+        desc: "A full-record envelope lands in Kinesis shard 2. The shard worker's GetRecords call returns it along with the Kinesis sequence number (an opaque, ever-increasing decimal string per shard). Nothing durable has moved yet; the stored checkpoint is still at its last-committed value.",
         on: ["n-kinesis","n-shard-2","n-parse"], edge: ["e-shards-parse"],
-        state: {"Shard": ["shard 2", "on"], "Seq": ["49600...842", "on"], "In-flight on tracker": ["0", ""]} },
-      { title: "envelope.parse → enroll in tracker",
-        desc: "The JSON parses into a typed FullRecord. Before dispatching it downstream the pipeline calls ShardSeqTracker.enroll(shard=2, seq=49600...842, tx_id=T, record_id=R). From this moment on, the tracker will refuse to let the checkpoint advance past this seq until it is explicitly RETIRED — which happens only on apply success or on an ingest-side DLQ route. This is how the checkpoint stays bounded by what has actually been handled.",
-        on: ["n-parse","n-tracker"], edge: ["e-parse-tracker"],
-        state: {"Shard": ["shard 2", "on"], "In-flight on tracker": ["1", "on"], "Checkpoint persisted": ["(unchanged)", ""]} },
-      { title: "Txn complete → ordering buffer",
-        desc: "This transaction's total_records = 1 (declared by the source), so the TransactionReassembler emits the CompletedTransaction immediately. It is pushed into the OrderingBuffer — a min-heap keyed by source.ts_ns. The applier does NOT yet pop it: we wait until the per-shard watermark proves no older timestamp can still arrive from any registered shard.",
-        on: ["n-txn","n-ordering"], edge: ["e-fragment-txn","e-txn-ordering"],
-        state: {"Buffered txns": ["1", "on"], "Head ts_ns": ["1700000...", "on"], "Fence": ["none", "ok"]} },
-      { title: "Release past watermark → applier",
-        desc: "Every registered shard now reports either (a) a latest_ts_ns newer than our head's or (b) 'idle for N seconds with Kinesis MillisBehindLatest = 0' — the synthetic-advance rule. The low watermark across shards advances past head.ts_ns. The applier pops the txn, computes its touched stripes by hashing (schema, table, pk), and acquires those asyncio locks in sorted order so parallel apply tasks don't deadlock.",
-        on: ["n-ordering","n-applier"], edge: ["e-ordering-applier"],
-        state: {"Watermark": ["1700000...+", "ok"], "Dispatched": ["1", "on"], "Stripes held": ["[7]", "on"]} },
-      { title: "pre_commit_hook: retire + upsert checkpoint",
-        desc: "The applier opens a DSQL BEGIN, writes the user row, writes the LWW stamp (__replicator_applied_v2). Just before COMMIT it calls the pre_commit_hook, which (a) calls tracker.retire_by_tx_record(T, R) — removing seq 49600...842 from in-flight, (b) asks tracker.safe_checkpoint(shard=2) which returns the newly-safe seq, (c) UPSERTs __replicator_checkpoints via the SAME cursor the applier is about to COMMIT. All four writes are inside one target transaction — if anything fails the DSQL COMMIT becomes a ROLLBACK and NONE of them land, including the checkpoint. Checkpoint advancement and the data it certifies are atomic.",
-        on: ["n-applier","n-tracker","n-checkpoints"], edge: ["e-tracker-applier","e-applier-ckpt"],
-        state: {"Retired this batch": ["1 seq", "ok"], "Safe seq (shard 2)": ["49600...842", "ok"], "Checkpoint upsert": ["IN TXN", "on"]} },
-      { title: "COMMIT",
-        desc: "The DSQL transaction commits atomically. If the process crashes RIGHT NOW, the next startup reads __replicator_checkpoints.sequence_number = 49600...842 and uses it as AFTER_SEQUENCE_NUMBER against Kinesis. Nothing is lost (because the checkpoint is at a seq we actually applied) and nothing double-applies (because any record that happens to re-arrive is deduped by the LWW stamp we just wrote).",
+        state: {"Shard": ["shard 2", "on"], "Seq": ["49600...842", "on"], "Apply queue depth": ["0", ""]} },
+      { title: "envelope.parse → push on apply queue",
+        desc: "The JSON parses into a typed FullRecord. The shard worker records seq=49600...842 as the shard's max-consumed sequence and enqueues the record (tagged with its origin shard id and seq) onto the shared apply queue. No per-record enrollment table; the shard-local counter and the atomic apply hook are enough.",
+        on: ["n-parse","n-queue"], edge: ["e-parse-queue"],
+        state: {"Shard": ["shard 2", "on"], "Apply queue depth": ["1", "on"], "Checkpoint persisted": ["(unchanged)", ""]} },
+      { title: "Apply worker drains batch + acquires stripes",
+        desc: "An apply worker pops this record (plus up to BATCH_MAX_TXNS - 1 more, or waits BATCH_MAX_WAIT_MS). It hashes each record's (schema, table, pk) into a stripe id and acquires the corresponding asyncio stripe locks in sorted order so parallel workers never deadlock. One stripe == one key family, so hot keys serialize behind one lock while cold keys stream through independently.",
+        on: ["n-queue","n-applier"], edge: ["e-queue-applier"],
+        state: {"Batch size": ["1", "on"], "Stripes held": ["[7]", "on"], "Workers idle": ["127", ""]} },
+      { title: "BEGIN → LWW gate → row DML",
+        desc: "Inside one DSQL BEGIN the applier executes: INSERT INTO __replicator_lww_stamps (schema, table, pk, applied_ts_ns) VALUES (…) ON CONFLICT (schema, table, pk) DO UPDATE SET applied_ts_ns = EXCLUDED.applied_ts_ns, applied_at = now() WHERE __replicator_lww_stamps.applied_ts_ns < EXCLUDED.applied_ts_ns. For a brand-new key cur.rowcount is 1, so the applier runs the row INSERT/UPSERT/DELETE. If the stamp had been rejected (older ts_ns) the row DML would be skipped and the record silently discarded.",
+        on: ["n-applier","n-applied","n-rows"], edge: ["e-applier-applied","e-applier-rows"],
+        state: {"Stamp advanced": ["yes", "ok"], "Row DML": ["executed", "ok"], "Rows discarded": ["0", "ok"]} },
+      { title: "pre_commit_hook → upsert checkpoint → COMMIT",
+        desc: "Just before COMMIT the applier calls the pre_commit_hook, which UPSERTs __replicator_checkpoints(stream, shard_id)=(…, shard 2) with sequence_number=49600...842 via the SAME cursor. The DSQL transaction then commits atomically. If the process crashes RIGHT NOW, the next startup reads __replicator_checkpoints.sequence_number = 49600...842 and uses it as AFTER_SEQUENCE_NUMBER against Kinesis. Nothing is lost; any record that happens to re-arrive is deduped by the LWW stamp.",
         on: ["n-applier","n-rows","n-applied","n-checkpoints"], edge: ["e-applier-rows","e-applier-applied","e-applier-ckpt"],
         state: {"Rows applied": ["1", "ok"], "Stamp written": ["yes", "ok"], "Checkpoint committed": ["49600...842", "ok"], "Txn committed": ["yes", "ok"]} },
     ]
   },
 
-  "cross-shard-chunk": {
-    label: "Cross-shard chunked txn",
-    topic: "Fragment reassembly across shards",
+  "chunked-row": {
+    label: "Chunked >1 MB row",
+    topic: "Cross-shard fragment reassembly",
     steps: [
       { title: "Chunked main lands on shard 0",
-        desc: "A record is too big for one Kinesis entry, so DSQL CDC splits it. The 'main' envelope lands on shard 0 and says: 'the actual before/after images live in 3 fragments, keyed by chunk_id = c-abc, with CRC32C = X.' The FragmentReassembler buffers the main and starts waiting for 3 fragments to arrive — on this shard or any other.",
+        desc: "A row is too big for one Kinesis entry, so DSQL CDC splits it. The 'main' envelope lands on shard 0 and says: 'the actual before/after images live in 3 fragments, keyed by chunk_id = c-abc, with CRC32C = X.' The FragmentReassembler buffers the main and starts waiting for 3 fragments to arrive — on this shard or any other.",
         on: ["n-shard-0","n-parse","n-fragment"], edge: ["e-shards-parse","e-parse-fragment"],
         state: {"Shard": ["shard 0", "on"], "chunk_id": ["c-abc", "on"], "fragments seen": ["0/3", "warn"]} },
-      { title: "Fragments 0,1 land on shards 1,2",
-        desc: "DSQL CDC publishes each fragment with its own partition key, which Kinesis hashes to a shard. Fragments 0 and 1 of chunk c-abc land on shards 1 and 2 — different from the shard the main record came in on. The FragmentReassembler is a single instance owned by the ConsumerPipeline, not one-per-shard-worker, so it buffers all three fragments regardless of which shard they arrive on. The same reasoning applies to the TransactionReassembler — a transaction's records can span any open shard and must be reassembled process-globally.",
-        on: ["n-shard-1","n-shard-2","n-parse","n-fragment"], edge: ["e-parse-fragment"],
-        state: {"Shard trail": ["0, 1, 2", "on"], "fragments seen": ["2/3", "warn"], "Reassembler scope": ["process-global", "ok"]} },
-      { title: "Fragment 2 on shard 3 → assembled",
-        desc: "The last fragment lands on shard 3. The reassembler sees all 3 fragments present for chunk c-abc, concatenates them in index order, verifies the CRC32C against the main record's declared value, and emits a single AssembledRecord. If the CRC mismatches, the reassembler raises CrcMismatchError and the pipeline routes the record to __replicator_dlq_ingest with reason='crc_mismatch' instead of forwarding corrupted bytes to the applier.",
-        on: ["n-shard-3","n-fragment","n-txn"], edge: ["e-parse-fragment","e-fragment-txn"],
-        state: {"Shard trail": ["0, 1, 2, 3", "ok"], "fragments seen": ["3/3", "ok"], "CRC32C": ["match", "ok"]} },
-      { title: "Apply commits — 4 shards' checkpoints advance together",
-        desc: "The AssembledRecord becomes a CompletedTransaction (via the TransactionReassembler) and heads to the applier. Because the main contributed on shard 0 and each fragment contributed on shards 1, 2, 3, this ONE txn's commit has to advance FOUR shards' checkpoints at once. The pre_commit_hook iterates the tracker's touched-shard set, computes safe_checkpoint() per shard, and UPSERTs __replicator_checkpoints four times through the same DSQL cursor. All four land atomically with the row apply, or none do.",
-        on: ["n-applier","n-tracker","n-checkpoints","n-rows","n-applied"], edge: ["e-ordering-applier","e-applier-rows","e-applier-ckpt","e-applier-applied"],
-        state: {"Shards checkpointed": ["4 (0,1,2,3)", "ok"], "Txn timeouts": ["0", "ok"], "Load-test observed": ["0 timeouts across 5,506 chunked txns", "ok"]} },
+      { title: "Fragments land on shards 1, 2, 3",
+        desc: "DSQL CDC publishes each fragment with its own partition key, which Kinesis hashes to a shard. The three fragments of chunk c-abc land on shards 1, 2, 3 — different from the shard the main record came in on. The FragmentReassembler is a single instance owned by the ConsumerPipeline, not one-per-shard-worker, so it buffers all three fragments regardless of which shard they arrive on. (Full records bypass this stage entirely.)",
+        on: ["n-shard-1","n-shard-2","n-shard-3","n-parse","n-fragment"], edge: ["e-parse-fragment"],
+        state: {"Shard trail": ["0, 1, 2, 3", "on"], "fragments seen": ["3/3", "ok"], "Reassembler scope": ["process-global", "ok"]} },
+      { title: "CRC verify → AssembledRecord → apply queue",
+        desc: "The reassembler concatenates the three fragments in index order, verifies the CRC32C against the main record's declared value, and emits a single AssembledRecord. If the CRC mismatches, the reassembler raises CrcMismatchError and the pipeline logs and increments CrcMismatches — the record never reaches the applier. On success the AssembledRecord is enqueued (tagged with the main's shard id and seq) just like any FullRecord.",
+        on: ["n-fragment","n-queue"], edge: ["e-fragment-queue"],
+        state: {"CRC32C": ["match", "ok"], "AssembledRecord": ["enqueued", "ok"]} },
+      { title: "Apply commits — main shard's checkpoint advances",
+        desc: "The apply worker takes the AssembledRecord through the same LWW-gate + row-DML + checkpoint-upsert path as a full record. Only the main record's shard checkpoint advances here; the fragment shards' sequences advance separately when those shards process their own records. The checkpoint-flush loop also periodically bumps quiet shards' checkpoints to their consumed seq, bounded by what's actually in the fragment buffer, so a shard whose only contribution was fragments does not get permanently pinned.",
+        on: ["n-applier","n-checkpoints","n-rows","n-applied"], edge: ["e-queue-applier","e-applier-rows","e-applier-ckpt","e-applier-applied"],
+        state: {"Shard checkpointed (atomic)": ["0", "ok"], "Fragment shards (periodic)": ["1, 2, 3", "ok"]} },
     ]
   },
 
-  "atomic-checkpoint": {
+  "crash-recovery": {
     label: "Crash recovery",
-    topic: "Safe checkpoint under crash",
+    topic: "Resume + LWW dedup",
     steps: [
-      { title: "Records buffered in reassembly",
-        desc: "On shard 0, seqs R6..R10 belong to a chunked transaction waiting on its last fragment to arrive. The FragmentReassembler holds them in memory. On other shards, newer records are arriving and applying. The pipeline's job is to decide a checkpoint for shard 0 that reflects reality — including the fact that R6..R10 are consumed but NOT YET applied.",
-        on: ["n-parse","n-fragment","n-txn","n-tracker"],
-        state: {"Buffered on shard 0": ["R6..R10", "warn"], "Fully applied on shard 0": ["through R5", "ok"], "In-flight on tracker (shard 0)": ["5 seqs", "warn"]} },
-      { title: "safe_checkpoint caps at R5",
-        desc: "ShardSeqTracker.safe_checkpoint(shard=0) returns the largest retired seq strictly less than min(in_flight). min(in_flight) on shard 0 is R6, so the maximum safe seq to persist is R5 — the newest sequence where EVERY seq at or below it is already disposed of (applied or DLQ'd). The tracker enforces this by construction: it will never return a value that could skip over a buffered record.",
-        on: ["n-tracker","n-checkpoints"], edge: ["e-tracker-applier","e-applier-ckpt"],
-        state: {"min(in_flight) shard 0": ["R6", "warn"], "safe_checkpoint(shard 0)": ["R5", "ok"], "Writer": ["pre_commit_hook (atomic)", "on"]} },
+      { title: "Steady-state applying",
+        desc: "The pipeline is running normally. Checkpoints for each shard advance in-band whenever a batch commits. Replication lag sits in the low seconds; the apply queue stays near zero.",
+        on: ["n-parse","n-queue","n-applier","n-checkpoints","n-rows","n-applied"],
+        state: {"Checkpoint (shard 0)": ["R5", "ok"], "Apply queue depth": ["3", "on"], "In-flight (shard 0)": ["R6..R8 queued", "warn"]} },
       { title: "Crash",
-        desc: "The process dies — SIGKILL, OOM, power loss, anything. The in-memory FragmentReassembler buffer, the OrderingBuffer, and the in-flight tracker state die with the process. __replicator_checkpoints.sequence_number remains at R5, which is where the last applied-and-committed batch left it.",
-        on: ["n-fragment","n-txn"],
-        state: {"Buffered (seqs)": ["R6..R10 (lost from memory)", "warn"], "Checkpoint on target": ["R5", "ok"], "User rows durable through": ["R5", "ok"]} },
-      { title: "Restart from AFTER R5",
-        desc: "The new consumer startup reads __replicator_checkpoints.sequence_number = R5 and calls Kinesis.GetShardIterator with ShardIteratorType=AFTER_SEQUENCE_NUMBER, StartingSequenceNumber=R5. Kinesis replays R6..R10 (they are still within the stream's retention window). The pipeline parses them, re-enrolls them in the tracker, and the chunked transaction reassembles when its last fragment arrives.",
-        on: ["n-shard-0","n-parse","n-fragment","n-txn"], edge: ["e-shards-parse","e-parse-fragment","e-fragment-txn"],
-        state: {"Resumed from": ["R5+1", "ok"], "Replayed": ["R6..R10", "ok"]} },
+        desc: "The process dies — SIGKILL, OOM, power loss, anything. The in-memory FragmentReassembler buffer and the apply queue die with the process. __replicator_checkpoints.sequence_number remains at R5, which is where the last applied-and-committed batch left it. Any records that were parsed on this shard but not yet applied (R6..R8) are also gone.",
+        on: ["n-fragment","n-queue"],
+        state: {"Buffered (seqs)": ["R6..R8 (lost from memory)", "warn"], "Checkpoint on target": ["R5", "ok"], "User rows durable through": ["R5", "ok"]} },
+      { title: "Lease expiry → sibling task takes over",
+        desc: "ECS respawns the task (or a sibling in multi-process mode steals the lease). __replicator_shard_leases rows have a 30-second TTL; the new task waits that long, then steals the lease atomically via a conditional UPDATE. Only one writer per shard at a time — the fencing token in the heartbeat path prevents a zombie old task from clobbering state after lease loss.",
+        on: ["n-leases","n-shard-0"], edge: ["e-leases-shards"],
+        state: {"Old lease": ["expired", "warn"], "New lease holder": ["new task", "ok"]} },
+      { title: "Resume from AFTER R5",
+        desc: "The new task reads __replicator_checkpoints.sequence_number = R5 and calls Kinesis.GetShardIterator with ShardIteratorType=AFTER_SEQUENCE_NUMBER, StartingSequenceNumber=R5. Kinesis replays R6..R8 (and anything newer that arrived during the gap). The pipeline parses them and enqueues them for apply.",
+        on: ["n-shard-0","n-parse","n-queue"], edge: ["e-shards-parse","e-parse-queue"],
+        state: {"Resumed from": ["R5+1", "ok"], "Replayed": ["R6..R8", "ok"]} },
       { title: "LWW stamp dedupes anything that already applied",
-        desc: "Some of R6..R10 may have applied moments before the crash — e.g. a sibling transaction committed just before the kill. On replay the applier runs its gated UPSERT against __replicator_applied_v2; the stored applied_ts_ns is already >= the incoming value, so the UPSERT no-ops and the row is not re-applied. 30-min load test observed exactly 40 crash-replay dedups through a consumer restart in the middle of batched applies — all handled silently and correctly.",
-        on: ["n-shard-0","n-parse","n-fragment","n-txn","n-applied"], edge: ["e-shards-parse","e-parse-fragment","e-fragment-txn","e-applier-applied"],
-        state: {"Replayed records applied again": ["0", "ok"], "Dedup count": ["40 observed in load test", "ok"], "Data loss": ["none", "ok"]} },
+        desc: "Some of R6..R8 may have applied moments before the crash (e.g. a sibling connection committed just before SIGKILL — rare but possible). On replay the applier runs its gated UPSERT against __replicator_lww_stamps; if the stored applied_ts_ns is already >= the incoming value the UPSERT no-ops (cur.rowcount == 0), the row DML is skipped, and the record is counted as discarded. The replica state is correct either way — row-level LWW is replay-safe by construction.",
+        on: ["n-shard-0","n-parse","n-queue","n-applier","n-applied"], edge: ["e-shards-parse","e-parse-queue","e-queue-applier","e-applier-applied"],
+        state: {"Replayed records applied again": ["0", "ok"], "Discarded on replay": ["as needed", "ok"], "Data loss": ["none (for full records)", "ok"]} },
     ]
   },
 
   "lww-race": {
-    label: "Out-of-order LWW",
-    topic: "Per-key convergence semantics",
+    label: "Out-of-order LWW (coffee / dinner)",
+    topic: "Per-key convergence, cross-row divergence",
     steps: [
-      { title: "T2 writes key B at ts=200",
-        desc: "Normal operation. A newer source transaction T2 at source.ts_ns=200 writes key B. The applier INSERTs the row and the LWW stamp (__replicator_applied_v2 keyed by schema+table+pk) stores applied_ts_ns=200 for B. Nothing surprising yet.",
+      { title: "T2 writes dinner row at ts=200",
+        desc: "A newer source transaction T2 at source.ts_ns=200 writes dinner.id = 7. Its record arrives on the replica and applies cleanly. __replicator_lww_stamps for (public, dinner, '7') now stores applied_ts_ns = 200. Nothing surprising yet.",
         on: ["n-applier","n-rows","n-applied"], edge: ["e-applier-rows","e-applier-applied"],
-        state: {"Key": ["B", "on"], "Applied ts": ["200", "ok"], "Stamp(B)": ["200", "ok"]} },
-      { title: "T1(A,B) at ts=100 — A is already applied",
-        desc: "Now an OLDER source transaction T1 at ts_ns=100 — which touched both A and B atomically at the source — arrives in two pieces because of CDC-side reordering (same tx_id, different records on different shards). T1.A arrived earlier and applied cleanly (its stamp didn't exist yet, so the gated UPSERT inserted). T1.B is still sitting in the OrderingBuffer. The watermark had already released past ts=100 earlier, which is why T2 could land — an unavoidable out-of-order release window: the watermark is derived from observed timestamps + Kinesis transport catch-up + a clock-skew budget, not from a source-side quiescence attestation (DSQL CDC does not currently expose one).",
-        on: ["n-ordering","n-rows"], edge: ["e-ordering-applier"],
-        state: {"T1.A applied": ["ts=100 ok", "ok"], "T1.B": ["buffered, ts=100", "warn"], "Replica state": ["A@T1, B@T2", "warn"]} },
-      { title: "T1.B dispatched → LWW rejects",
-        desc: "The applier pops T1.B and runs a gated UPSERT: INSERT INTO __replicator_applied_v2 … ON CONFLICT DO UPDATE SET applied_ts_ns = EXCLUDED.applied_ts_ns WHERE existing.applied_ts_ns < EXCLUDED.applied_ts_ns. For key B the existing stamp is 200, the incoming is 100, so the WHERE clause is FALSE — the UPSERT does nothing, cur.rowcount is 0. The applier reads that as 'this is an older write; skip the user row.' No corrupting write hits the target.",
-        on: ["n-applier","n-applied","n-late"], edge: ["e-applier-applied","e-applier-late"],
-        state: {"Stamp(B) stored": ["200", "ok"], "Incoming T1.B": ["100", "warn"], "Decision": ["REJECT (older)", "warn"]} },
-      { title: "Audit to __replicator_late_discards",
-        desc: "The rejected record still gets persisted — to __replicator_late_discards with its full payload, incoming vs stored ts_ns, and the delta in milliseconds. This happens inside the same DSQL txn as the stamp lookup, so either both land or neither does. CloudWatch RowsLateDiscarded ticks. Important honesty note: the replica now holds (A@T1, B@T2), a cross-row combination that NEVER existed at the source. Per-key LWW gives eventual convergence per key — but NOT SQL transaction-level consistency across keys. The audit table is how operators discover when this is happening and on which keys.",
-        on: ["n-applier","n-late"], edge: ["e-applier-late"],
-        state: {"Audit row written": ["yes", "audit"], "Replica now holds": ["(A@T1, B@T2) — cross-txn inconsistent", "warn"], "Consistency model": ["eventual per-key, NOT SQL-level", "warn"]} },
+        state: {"Row": ["dinner.id=7", "on"], "Applied ts": ["200", "ok"], "Replica state": ["dinner=T2 only", "ok"]} },
+      { title: "T1 at ts=100 (older) arrives for coffee row",
+        desc: "An OLDER source transaction T1 at ts_ns=100 wrote BOTH coffee.id=42 AND dinner.id=7 atomically at the source. Kinesis delivered T2's record (on different rows) first because the stream is unordered across shards. Now T1's coffee record arrives. The replica currently shows (coffee=original, dinner=T2) — a state the source NEVER had. Caleb's observation: this is the honest cost of using Kinesis for CDC fan-out.",
+        on: ["n-queue","n-applier"], edge: ["e-queue-applier"],
+        state: {"T1.coffee incoming": ["ts=100", "on"], "T1.dinner incoming": ["ts=100", "warn"], "Replica state": ["coffee=orig, dinner=T2", "warn"]} },
+      { title: "LWW gate accepts T1.coffee (first write)",
+        desc: "coffee.id=42 has no stamp yet, so INSERT INTO __replicator_lww_stamps … WHERE existing < incoming fires on the ON CONFLICT branch's insert path: cur.rowcount == 1. The applier runs the row UPSERT. Now coffee.id=42 holds T1's value with stamp 100.",
+        on: ["n-applier","n-applied","n-rows"], edge: ["e-applier-applied","e-applier-rows"],
+        state: {"coffee.id=42 stamp": ["100", "ok"], "Row applied": ["yes", "ok"], "Replica state": ["coffee=T1, dinner=T2", "ok"]} },
+      { title: "T1.dinner arrives → LWW rejects (older)",
+        desc: "T1.dinner's record arrives at ts=100 — but __replicator_lww_stamps for (public, dinner, '7') already stores 200 (from T2). The WHERE clause 'existing.applied_ts_ns < EXCLUDED.applied_ts_ns' is FALSE; cur.rowcount == 0; the applier skips the row DML. The record counts as rows_discarded. This is correct: T2 is the newest write for this row, and the replica already reflects it.",
+        on: ["n-applier","n-applied"], edge: ["e-applier-applied"],
+        state: {"dinner.id=7 stamp": ["200 (unchanged)", "ok"], "T1.dinner decision": ["REJECT (older)", "warn"], "RowsDiscarded": ["+1", "ok"]} },
+      { title: "Final state — rows converge, transaction does NOT",
+            desc: "Final replica state: coffee=T1, dinner=T2. Each row holds the latest source commit for its primary key — that is the row-level LWW guarantee. But T1 was a single source transaction that touched BOTH rows; the replica never shows coffee=T1 AND dinner=T1. If your application needs cross-row invariants (foreign keys to a just-inserted parent, denormalized aggregates, 'if coffee=X then dinner=Y' checks), read from the source region. See README 'Row-level eventual consistency' and docs/DESIGN.md §1a for the full contract.",
+        on: ["n-applier","n-rows","n-applied"],
+        state: {"Row-level": ["converged ✓", "ok"], "Transaction-level": ["divergent ✗", "warn"], "Operator action": ["none — expected", ""]} },
     ]
   },
 
-  "ingest-dlq": {
-    label: "Ingest-side reject → DLQ",
-    topic: "Capturing malformed input",
+  "persistent-failure": {
+    label: "Persistent apply failure (no fence)",
+    topic: "Infinite retry → hot stripe",
     steps: [
-      { title: "Malformed envelope arrives",
-        desc: "A record on shard 1 fails envelope.parse() — e.g. truncated JSON, a type discriminator that isn't full/chunked/fragment, or a missing required field. The pipeline treats this as something to disposition explicitly: every malformed input gets a durable record and an operator-visible metric.",
-        on: ["n-shard-1","n-parse"], edge: ["e-shards-parse"],
-        state: {"Reason": ["parse_error", "warn"], "Raw bytes": ["kept", "warn"]} },
-      { title: "Enroll + retire by seq",
-        desc: "The record was already enrolled in ShardSeqTracker when we read it from Kinesis. If we didn't retire it, safe_checkpoint(shard 1) would stay stuck below this seq forever — forever is a long time at 50 TPS. We call retire_by_seq(shard, seq) because we don't have a tx_id or chunk_id (the parse failed before we could extract them). The tracker now considers this seq handled; the checkpoint can advance past it on the next commit.",
-        on: ["n-parse","n-tracker"], edge: ["e-parse-tracker"],
-        state: {"Tracker state": ["(shard 1, seq) retired", "ok"], "Checkpoint can advance": ["yes, past this seq", "ok"]} },
-      { title: "Route to __replicator_dlq_ingest",
-        desc: "DlqWriter.record_ingest_reject INSERTS a row into __replicator_dlq_ingest with reason='parse_error', the raw Kinesis bytes, and metadata (stream, shard, timestamp). It fails open: a transient DSQL write error is logged — not raised — because the ingest-reject row is forensics, not a correctness barrier. CloudWatch ParseErrors ticks. The dashboard's 'Errors & fence lifecycle' row surfaces it so operators see non-zero counts within one metric-interval.",
-        on: ["n-parse","n-dlq-ingest"], edge: ["e-parse-dlq"],
-        state: {"Row written": ["uuid, parse_error, raw_bytes", "warn"], "CloudWatch metric": ["ParseErrors += 1", "warn"], "Operator signal": ["dashboard + alarm", "warn"]} },
-      { title: "Same path for CRC / fragment / txn timeouts",
-        desc: "Three other ingest-side failures use the same helper: crc_mismatch (FragmentReassembler raised CrcMismatchError), fragment_timeout (periodic sweep of chunks whose last fragment never arrived), txn_timeout (periodic sweep of txns whose last record never arrived). Each route tags its own reason, writes its own __replicator_dlq_ingest row, and bumps its own CloudWatch counter. The arithmetic from the 30-min load test exactly matches: 342 parse_errors + 34 crc_mismatches + 34 fragment_timeouts = 410 ingest_rejects_recorded. None were dropped silently.",
-        on: ["n-dlq-ingest"],
-        state: {"parse_errors": ["342", "warn"], "crc_mismatches": ["34", "warn"], "fragment_timeouts": ["34", "warn"], "ingest_rejects_recorded": ["410 ✓", "ok"]} },
-    ]
-  },
-
-  "fence-pause": {
-    label: "Apply failure → fence",
-    topic: "DLQ fence lifecycle",
-    steps: [
-      { title: "Apply failure on tx at ts=T_bad",
-        desc: "A transaction hits a non-retryable error at commit time — e.g. a target-DSQL CHECK constraint fires, a column is missing because the operator forgot to migrate the target schema, or a FK references a row that doesn't exist. The applier retries up to apply_max_retries (default 5) with exponential backoff, then raises ApplyError. This record cannot land without operator action.",
+      { title: "Apply hits a non-retryable DSQL error",
+        desc: "A record targets a row in a table that is missing a column on the target (operator forgot to migrate). The row DML raises FeatureNotSupported or DatatypeMismatch — not a transient class. In the pre-simplification design this would open a DLQ fence and halt the pipeline. Now the applier logs apply.unexpected_retrying and goes into exponential backoff on that stripe.",
         on: ["n-applier"],
-        state: {"Failing txn ts_ns": ["T_bad", "danger"], "Attempts": ["5 (exhausted)", "danger"]} },
-      { title: "Fence opens at T_bad",
-        desc: "DlqWriter.open_fence writes TWO rows atomically to the target DSQL: __replicator_dlq_fences (tx_id, fence_ts_ns=T_bad, status=OPEN, error_class, failing_sql) and __replicator_dlq_payload (tx_id, full CompletedTransaction as JSONB). It then sets OrderingBuffer.fence_ts_ns = T_bad in memory. From this instant, OrderingBuffer.ready() will refuse to release any txn whose ts_ns >= T_bad — all later-timestamped work queues behind the fence until an operator resolves it.",
-        on: ["n-dlq-fence","n-ordering"], edge: ["e-applier-fence"],
-        state: {"Fence row": ["OPEN at T_bad", "danger"], "Ordering release gate": ["< min(watermark, T_bad)", "warn"]} },
-      { title: "Operational pause (not strict barrier)",
-        desc: "The fence is deliberately an operational pause, not a strict ts_ns commit barrier. When the fence opens, concurrent apply tasks (we run several in parallel) may already be INSIDE their own DSQL transactions carrying txns at ts_ns > T_bad. Those transactions are holding row locks and about to COMMIT; they do not re-check the fence state. The fence stops NEW dispatches, not in-flight commits. A pre-commit fence check would add a cross-region round-trip to every commit, every batch — for a condition that fires rarely in production. The replica is still eventually correct: the fenced txn is the ONE that failed, and new work on the same keys past T_bad will arrive on top anyway. The pause gives operators 'stop and look' semantics without that recurring cost.",
-        on: ["n-dlq-fence","n-applier","n-ordering"],
-        state: {"Future releases": ["halted at T_bad", "ok"], "In-flight commits past T_bad": ["can land", "warn"], "Semantics": ["operational pause", "warn"]} },
-      { title: "Operator runs ops dlq retry / skip",
-        desc: "The operator inspects the fence (`dsql-replicator ops dlq inspect <tx_id>` dumps the payload) and either runs `ops dlq retry <tx_id>` (replays the DSQL writes from the stored payload — succeeds if the operator has since fixed the schema, cleared the FK, etc.) or `ops dlq skip --confirm <tx_id>` (marks the fence SKIPPED without applying — explicit operator choice). The fence row flips to CLOSED or SKIPPED. The fence_poller task (every 5s by default) notices OPEN count = 0 and clears OrderingBuffer.fence_ts_ns. Buffered txns past T_bad flow through, and the applier resumes.",
-        on: ["n-dlq-fence","n-ordering"],
-        state: {"Fence status": ["CLOSED or SKIPPED", "ok"], "Ordering buffer": ["draining past T_bad", "on"]} },
+        state: {"Error class": ["DatatypeMismatch", "danger"], "Stripe": ["47", "warn"], "Fence": ["none (removed)", "ok"]} },
+      { title: "Retry forever, bounded backoff",
+        desc: "The retry loop sleeps up to backoff_cap_s (default 10s) between attempts. Each retry acquires a fresh pool connection and tries again. CPU cost of the hot retry is bounded because the backoff caps and only one stripe is affected — the other 8191 stripes continue applying normally. The pipeline keeps moving on every key except this one.",
+        on: ["n-applier","n-queue"],
+        state: {"Attempt": ["N (growing)", "warn"], "Other stripes": ["flowing", "ok"], "ApplyQueueDepth": ["growing on this key", "warn"]} },
+      { title: "Signals operators see",
+        desc: "ReplicationLag ticks up slowly as records accumulate behind the stuck stripe. ApplyQueueNearCap eventually fires if the stuck key is hot enough. Logs show the same error_class / size / stripe combination repeating. There is no fence row to inspect — the operator reads logs and the dashboard.",
+        on: ["n-applier","n-queue"],
+        state: {"ReplicationLag": ["rising", "warn"], "ApplyQueueNearCap": ["may fire", "warn"], "What to grep for": ["apply.unexpected_retrying", "on"]} },
+      { title: "Operator fixes target → retry succeeds, pipeline resumes",
+        desc: "The operator runs ALTER TABLE on the target to add the missing column. The next retry on the stuck record succeeds; the row applies, the LWW stamp advances, the checkpoint upserts, the stripe lock releases, and the apply queue drains. No CLI command is required. No fence row to CLOSE. This is the whole on-call flow for a persistent apply failure under the new design — see RUNBOOK §5 for the full playbook.",
+        on: ["n-applier","n-rows","n-applied","n-checkpoints","n-queue"], edge: ["e-queue-applier","e-applier-rows","e-applier-applied","e-applier-ckpt"],
+        state: {"Target fixed": ["ALTER TABLE applied", "ok"], "Retry succeeded": ["yes", "ok"], "Pipeline": ["drained + green", "ok"]} },
     ]
   },
 };

@@ -125,95 +125,100 @@ so customers do not have to re-derive these trade-offs.
 
 Each entry: what we decided, why we decided it, what we traded away.
 
-### 3.1 Reassemble every transaction before any downstream stage sees it
+### 3.1 (2026-11 removed) Cross-shard transaction reassembly
 
-The CDC envelope carries a transaction id and a total-records count on every
-record of a transaction. The pipeline buffers records keyed by transaction id
-and releases only when the count matches.
+The pipeline used to buffer records by `tx_id` and emit a `CompletedTransaction`
+only when `len(buffered) == total_records`. **Removed in Nov 2026.** Kinesis
+cannot preserve DSQL transaction order across shards (service team confirmed
+with Caleb Bitting), so reassembly produced a `CompletedTransaction` whose
+records already had no cross-shard ordering guarantee at the source. The
+ordering buffer below then released those transactions against a synthetic
+watermark that could — and did — advance before every older-`ts_ns` record
+had arrived.
 
-- **Why.** Without this, Kinesis's cross-shard unorderedness makes
-  partial-transaction apply the normal case. This invariant is the
-  load-bearing primitive that makes atomic cross-row apply downstream
-  possible.
-- **Trade-off.** Memory held per in-flight transaction, plus a timeout path
-  for transactions whose records never fully arrive. The timeout surface is
-  explicitly tested; we do not rely on it in production.
+What replaced it: records flow straight from `FragmentReassembler` to the
+apply queue; per-primary-key last-writer-wins (§3.4) does the real
+correctness work.
 
-### 3.2 Per-shard ordering with a bounded priority buffer
+### 3.2 (2026-11 removed) Ordering buffer with per-shard watermark gate
 
-Completed transactions sit in a priority queue keyed by their source
-timestamp. The queue releases a transaction only when every shard's
-watermark has advanced past it, using a strict less-than rule. The buffer has
-a hard cap; when full it back-pressures the Kinesis reader.
+A priority queue keyed by source `ts_ns`, gated on
+`min(latest_ts_ns)` across shards with an idle-shard synthetic advance when
+Kinesis `MillisBehindLatest == 0`. **Removed in Nov 2026.** The gate was
+never a safe source-side quiescence signal — it was Kinesis-transport
+catch-up plus a wall-clock synthetic — so the buffer could and did release
+transactions before every older-`ts_ns` record had arrived. The LWW stamp
+was absorbing the resulting out-of-order releases anyway.
 
-- **Why.** Out-of-order release across shards would commit a newer timestamp
-  before an older one and break the per-key ordering guarantee downstream.
-  The strict less-than rule prevents equality collisions where two shards
-  happen to carry the same timestamp. The hard cap prevents unbounded memory
-  as a failure mode when the applier is slower than the consumer.
-- **Trade-off.** One extra ingest tick of latency at the gate. Under
-  sustained back-pressure, Kinesis's 24-hour retention becomes the overflow
-  buffer.
+What replaced it: the apply queue (`asyncio.Queue`) bounded by
+`ORDERING_BUFFER_MAX_DEPTH` (env name retained for operator continuity).
+Order is enforced per primary key by the LWW stamp (§3.4), not across keys.
 
-### 3.3 Per-key stripe-locked parallel apply (not serial, not per-row)
+### 3.3 Per-key stripe-locked parallel apply (not serial, not per-row-independent)
 
-The applier owns N stripes. Each transaction hashes its primary keys into a
-sorted set of stripes, acquires those stripes' locks in sorted order, then
-runs one atomic target-side transaction holding only those stripes.
-Transactions on disjoint keys commit concurrently; transactions sharing any
-key serialize on that key.
+The applier owns N stripes. Each apply batch hashes the primary keys of its
+records into a sorted set of stripes, acquires those stripes' locks in
+sorted order, then runs one atomic target-side transaction holding only
+those stripes. Batches on disjoint keys commit concurrently; batches sharing
+any key serialize on that key.
 
-- **Why.** An earlier design serialized the entire commit lane for a global
-  timestamp order and capped at a handful of transactions per second —
-  unusable for any realistic workload (OLTP commonly runs 50–500 TPS).
-  Per-row order is the contract SQL already gives per row; cross-key order
-  was conservative, not required. Industry CDC pipelines (DMS, Debezium
-  Sink, Striim, Fivetran) all do this for the same reason.
-- **Trade-off.** Cross-row application-level atomicity across the replica is
-  lost. The system now matches the standard CDC contract rather than
-  offering a stronger one.
+- **Why.** A serial applier capped at a handful of records per second on
+  cross-region commits (~400 ms RTT) — unusable for any realistic workload
+  (OLTP commonly runs 50–500 TPS). Stripe-locking per primary key gives
+  parallelism without stepping on OCC conflicts for the same row. Industry
+  CDC pipelines (DMS, Debezium Sink, Striim, Fivetran) all do this for the
+  same reason.
+- **Trade-off.** Cross-row atomicity across the replica is not preserved
+  (see §1a). The system matches the standard CDC contract rather than
+  claiming a stronger one.
 
 ### 3.4 Idempotent apply via per-key last-writer-wins stamps in the target database
 
-*Note: see the 2026-10-26 LWW section below for the current design. The
-historical description preserved here captures the original single-stamp
-intent; the invariant has since been strengthened to per-key `ts_ns`
-LWW to absorb at-least-once CDC redelivery.*
+The target cluster holds `__replicator_lww_stamps` keyed by
+`(schema_name, table_name, primary_key)` carrying the latest source `ts_ns`
+applied for that key. Each row apply is a conditional UPSERT inside the
+same target transaction as the row DML — the DML runs only when the
+incoming `ts_ns` strictly exceeds the stored one. Replays see the stamp
+and short-circuit.
 
-The target cluster holds a stamp table keyed by `(schema_name, table_name,
-primary_key)` carrying the latest source `ts_ns` applied for that key. Each
-row apply is a conditional UPSERT inside the same target transaction as
-the row DML — the DML runs only when the incoming `ts_ns` strictly exceeds
-the stored one. Replays see the stamp and short-circuit.
+Since the 2026-11 simplification pass this is the **only** correctness
+primitive — transaction reassembly and ordering buffer are gone. See §1a
+for the full contract and the historical 2026-10-26 writeup near the end
+of this doc for the design evolution that got us here.
 
 - **Why.** Any other scheme creates a window where "crashed between apply
   and remembering we applied" produces a duplicate or a loss. Putting the
   stamp outside the target database (e.g., DynamoDB) makes stamping
   non-atomic with the row and turns recovery into a correctness problem
-  rather than a bookkeeping one.
-- **Trade-off.** The stamp table grows forever unless pruned (acceptable at
-  current scale), and one extra SELECT per record on replay.
+  rather than a bookkeeping one. The strict-greater-than gate also handles
+  out-of-order and late-arriving older commits.
+- **Trade-off.** The stamp table grows with the count of distinct primary
+  keys ever touched. One extra UPSERT per record on the hot path. Cross-row
+  invariants of a source transaction are not preserved (§1a).
 
 ### 3.5 State plane co-located in the target DSQL cluster
 
-Six tables — applied-stamps, DLQ fence, DLQ payload, checkpoints, shard
-leases, watermark state — all live inside the target DSQL cluster alongside
-the user data.
+**Three tables** — LWW stamps, checkpoints, shard leases — all live inside
+the target DSQL cluster alongside the user data.
 
-- **Why.** Every correctness-critical state transition ("apply the row, mark
-  it applied, close the fence that covered it, advance the checkpoint") can
-  happen in one target-side transaction. There is no distributed-state
-  coordination problem to engineer around. One IAM boundary, one failure
-  domain.
+- **Why.** Every correctness-critical state transition ("apply the row,
+  advance its LWW stamp, advance the per-shard checkpoint") happens in one
+  target-side transaction. There is no distributed-state coordination
+  problem to engineer around. One IAM boundary, one failure domain.
 - **Trade-off.** Writes to the target include replicator overhead. Losing
   the target cluster means losing the state plane. The replicator's
   reliability is bounded by the target cluster's.
 
 An earlier design kept checkpoints and watermark state in DynamoDB and only
-moved DLQ into target DSQL. That contradicted the stated principle "state
-lives where the applier runs" and introduced cross-service consistency logic
-for the lease. We reversed it, consolidated to six tables in the target
-cluster, and deleted the DynamoDB infrastructure.
+moved DLQ into target DSQL. That contradicted "state lives where the applier
+runs" and introduced cross-service consistency logic for the lease. We
+reversed it. The 2026-11 simplification pass then shrank the state plane
+further — the former `__replicator_dlq_fences`, `__replicator_dlq_payload`,
+`__replicator_dlq_ingest`, `__replicator_late_discards`,
+`__replicator_watermark_state`, and `__replicator_applied_v2` tables are
+gone (the stamp table was renamed `__replicator_applied_v2` →
+`__replicator_lww_stamps`). Operators upgrading can drop the old tables
+manually; they are inert.
 
 ### 3.6 Single-writer per shard, enforced by a fencing-token lease
 
@@ -232,31 +237,30 @@ horizontal scale.
   Horizontal scale would require weakening the cross-shard ordering
   guarantee or introducing cross-task coordination; neither is shipped.
 
-### 3.7 DLQ "fence" as a durable, inspectable per-transaction quarantine
+### 3.7 (2026-11 removed) DLQ fence as a durable, inspectable per-transaction quarantine
 
-When a transaction fails permanently to apply (schema mismatch, constraint
-violation, unknown table), the applier writes one fence row to the target
-cluster and a payload row preserving the whole transaction. The ordering
-stage refuses to release any transaction past the fence timestamp until an
-operator closes it. Retry re-applies the stored payload and closes the fence
-inside one target transaction.
+The applier used to write a fence row + payload row to the target cluster on
+permanent apply failure, halting forward progress past that transaction's
+`ts_ns` until an operator ran `ops dlq retry` or `ops dlq skip`. **Removed
+in Nov 2026** alongside the ordering buffer: with no cross-shard transaction
+ordering being enforced, a `ts_ns`-pinned fence no longer corresponded to a
+meaningful "commit barrier." The LWW stamp absorbs duplicates and
+out-of-order deliveries directly.
 
-- **Why.** Silently skipping diverges the target. Retrying forever loses
-  forward progress. Crashing the process is operator-hostile and loses
-  in-flight state. A durable, inspectable fence pinned to the exact failing
-  transaction is the only option that preserves correctness and gives
-  operators a one-command recovery. Keeping the payload in the target means
-  retry is a pure target-side operation — no Kinesis replay needed.
-- **Trade-off.** The current fence is **global** — any one failure halts
-  all forward progress. Per-primary-key quarantine (hold only transactions
-  touching the fenced keys) is a possible extension. Today's behavior is
-  correct, just more disruptive than it needs to be.
+What replaced it: the applier retries transient failures forever with
+exponential backoff (connection drops, serialization conflicts); persistent
+`ApplyError` (schema missing on target, malformed record) logs loudly and
+drops the batch so other keys keep flowing. CloudWatch alarms on
+`ApplyQueueNearCap` and `ReplicationLag` surface a stuck key before
+anything else goes wrong. The `ops dlq ...` and `pause`/`unpause` CLI
+commands are gone.
 
 ### 3.8 DDL is explicitly not replicated
 
 The applier assumes schemas exist on both sides. When it hits an unknown
-table or column, it raises an apply error, which opens a fence; the operator
-applies the DDL on the target and runs retry.
+table or column, it raises an `ApplyError`, logs loudly, and drops the batch
+so other keys keep flowing. The operator applies the DDL on the target;
+subsequent batches apply cleanly.
 
 - **Why.** Inferring DDL from CDC is brittle. Column renames, type changes,
   index creation, triggers, and defaults all fail in different ways. Getting
@@ -284,9 +288,10 @@ region.
 
 Both Kinesis and both DSQL clusters authenticate via IAM-generated
 short-lived tokens (~15 minutes). Every long-running connection — state
-connection, DLQ writer, schema cache — wraps each operation in a one-retry
-loop that reconnects on expired-token errors. The container also writes a
-liveness heartbeat file that the healthcheck reads.
+connection, schema cache, apply pool — wraps each operation in a one-retry
+loop that reconnects on expired-token errors. Pool connections are
+proactively recycled before their token expires. The container also writes
+a liveness heartbeat file that the healthcheck reads.
 
 - **Why.** DSQL does not offer long-lived credentials. An earlier revision
   had reconnect only on the applier's commit lane; stress testing exposed
@@ -303,10 +308,10 @@ liveness heartbeat file that the healthcheck reads.
 
 The replicator runs as one Fargate task behind an ECS service with the
 deployment circuit breaker enabled. The task role is scoped to one Kinesis
-stream, two DSQL cluster ARNs, two SNS topics, and one CloudWatch namespace.
-Five alarms (apply failures, open fence, ordering buffer near cap, watermark
-lag, Kinesis records-behind-latest) publish to a dedicated SNS topic. A
-customer-managed KMS key encrypts both SNS topics at rest.
+stream, two DSQL cluster ARNs, one SNS topic (alarms), and one CloudWatch
+namespace. **Three alarms** — apply queue near cap, replication lag,
+Kinesis records-behind-latest — publish to the alarms topic. A
+customer-managed KMS key encrypts the alarms topic at rest.
 
 - **Why.** Lambda's execution limits make long-running CDC consumption
   impractical. EKS adds a cluster to operate for one container. Fargate is
@@ -322,85 +327,81 @@ customer-managed KMS key encrypts both SNS topics at rest.
 ## 4. What these choices solve, by failure class
 
 **Correctness.** Duplicate deliveries and operator retries never produce
-duplicate rows on the target (per-transaction stamp table). Partial
-transactions never become visible to target readers (reassembly before
-release + one-transaction atomic apply). Out-of-order delivery within a
-transaction is absorbed by the grouping stage; out-of-order delivery across
-shards is absorbed by the ordering stage.
+duplicate row effects on the target (per-key LWW stamp inside the same
+target transaction as the row DML). Late-arriving older commits on a key
+that already has a newer applied value are rejected by the stamp gate.
+Cross-row transaction atomicity is **not** preserved on the replica —
+documented in §1a and §5 as the headline trade-off.
 
-**Liveness.** A stuck transaction opens a durable fence rather than crashing
-the process or looping forever. Expired IAM tokens trigger an in-process
-reconnect on the next operation. An operator-initiated pause reuses the
-fence mechanism, so there is one halting primitive, not two. Idle shards get
-a synthetic watermark advance when Kinesis itself reports they are caught
-up, so a quiet shard does not freeze the pipeline. Ordering-buffer
-back-pressure stops advancing the Kinesis iterator rather than silently
-dropping records.
+**Liveness.** Transient apply failures retry forever with exponential
+backoff — connection drops, serialization conflicts, cross-region hiccups
+all clear themselves. A persistent apply failure (schema drift, bad DML)
+drops its batch so other keys keep flowing; the operator sees it on the
+dashboard as a growing apply queue and replication lag. Expired IAM tokens
+trigger an in-process reconnect on the next operation; pool connections are
+pre-emptively recycled before token expiry. Apply-queue back-pressure stops
+advancing the Kinesis iterator rather than silently dropping records.
 
 **Operability.** Failover is clean: the shard lease lives next to the data
 its owner is writing, with a heartbeat and a fencing token. Lag visibility
-comes from a dashboard with single-value tiles for the four signals an
-on-call reads first, plus five alarms with decision trees in the runbook.
-The blast radius of a bad write is bounded by the fence — forward progress
-halts, nothing silently diverges. The runbook explicitly tells on-call what
+comes from a dashboard with single-value tiles (apply queue depth,
+replication lag), time-series panels (throughput, ingest errors,
+lag + queue, lease activity), and three alarms with decision trees in the
+runbook. The operational surface is small: no fence to close, no DLQ to
+drain, no `ops dlq retry` to run. The runbook explicitly tells on-call what
 NOT to do: there is no DynamoDB to touch, SSH is rarely needed, Kinesis
-replay is unnecessary because the stored payload makes retry a pure
-target-side operation.
+replay is unnecessary because records keep flowing from Kinesis and LWW
+makes re-apply idempotent.
 
 **Scaling.** Per-key parallel apply unlocks throughput for workloads whose
-keys are reasonably distributed (measured roughly 6× transaction and 12× DML
-improvement over the prior serial lane). Hot-key workloads cap at ~3
-updates/second per unique primary key — cross-region commit latency is
-physics, not software. Backlog grows linearly, not exponentially, under
-sustained over-load and drains after load stops. The system is stable under
+keys are reasonably distributed. Hot-key workloads cap at ~3 updates/second
+per unique primary key — cross-region commit latency is physics, not
+software. Backlog grows linearly, not exponentially, under sustained
+over-load and drains after load stops. The system is stable under
 over-provisioning, not runaway.
 
 ---
 
 ## 5. Known limits
 
-- **Steady-state apply ceiling** on the single-task shape is ~250 TPS
-  cross-region. Above that, lag grows linearly and drains post-load.
-  Multi-task scale with weakened cross-shard ordering is a possible
-  extension; not shipped.
+- **Row-level, not transaction-level, consistency.** The LWW stamp
+  (`__replicator_lww_stamps`) delivers *eventual per-primary-key convergence*
+  under out-of-order delivery and at-least-once CDC redelivery. It does
+  **not** deliver SQL transaction-level consistency. A source transaction
+  `T1(A, B)` can appear split on the replica if the Kinesis delivery order
+  interleaves with another source transaction `T2(B)`: the replica may
+  briefly hold `(A@T1, B@T2)`, a state that never existed at the source.
+  See §1a for the "coffee / dinner" example. If your application needs
+  cross-row read-after-commit guarantees, read from the source region.
+- **Fragments (>1 MB rows) spanning shards can lose a single row on crash
+  before the next source write.** The fragment reassembler is
+  process-global and holds fragments in memory until the main record
+  assembles. A task crash with fragments still buffered loses that row
+  until the next source write to the same primary key, which LWW will
+  then apply. Operationally rare; non-fragmented rows (the vast majority
+  of CDC traffic) are not affected.
+- **Infinite apply retry** on a persistent target-side defect (e.g., schema
+  drift) burns CPU in the retry loop. Alarm on `ApplyQueueNearCap` and
+  `ReplicationLag` — a stuck key will show up as a growing queue and stale
+  lag before anything else goes wrong.
+- **Steady-state apply ceiling** on the single-task shape is ~700 TPS
+  cross-region at `APPLIER_WORKERS=128 / APPLIER_STRIPES=8192`. Above that,
+  lag grows linearly and drains post-load. Multi-task scale with
+  deterministic shard partition is a possible extension; not shipped.
 - **Hot-key workloads** cap at ~3 updates/second per unique primary key.
+- **`APPLIER_STRIPES` must be ≫ `APPLIER_WORKERS × avg_stripes_per_batch`**
+  or workers queue on asyncio stripe locks and the applier floor collapses
+  to the serial RTT. See the 2026-10-26 stripe-contention finding below.
 - **DDL is not replicated** — operator applies schema changes to both
   clusters out of band.
 - **Service runs at `desiredCount=1`.** The lease model is for failover, not
   throughput.
 - **Historical rows written before the replicator was started cannot be
-  bridged** — Kinesis retention is 24 hours (extendable to 7 days). The
-  design surfaces this as a CloudWatch metric so an alarm fires before data
-  is lost.
-- **Cross-row application-level atomicity across the replica is not
-  preserved** — only per-row order. This matches standard CDC behavior.
-- **Cross-transaction consistency on the replica is NOT preserved.** The
-  per-key LWW stamp (`__replicator_applied_v2`) delivers *eventual per-key
-  convergence* under out-of-order delivery; it does not deliver SQL
-  transaction-level consistency. A source transaction `T1(A, B)` can be
-  split across the replica if `T1.A` loses the LWW race to a later `T2.B`:
-  the replica then holds `(A@T1, B@T2)`, a state that never existed at the
-  source. Rows that lose the LWW race are archived to
-  `__replicator_late_discards` and surfaced on `RowsLateDiscarded`; alarm
-  on nonzero rate.
-- **The release watermark is NOT a source-side quiescence signal.** The
-  ordering buffer gates on `min(latest observed `source.ts_ns`)` across
-  shards, with an idle-shard synthetic advance when Kinesis
-  `MillisBehindLatest == 0`. "Caught up on Kinesis" is not "caught up on
-  source CDC emission" — a later-published older commit can still arrive.
-  Out-of-order releases are absorbed by the LWW stamp above. The
-  `WatermarkTsNs` metric is "max source ts we have decided to release past",
-  not an end-to-end lag.
-- **The DLQ fence is an operational pause, not a strict `ts_ns` commit
-  barrier.** When an apply failure opens a fence at `fence_ts_ns`, future
-  releases from the ordering buffer stop at `fence_ts_ns`. In-flight batch
-  tasks whose txns were dispatched before the fence was observed can still
-  COMMIT past `fence_ts_ns` — the fence doesn't revoke in-flight commits.
-  This matches a human operator's expectation of "stop and look," not a
-  strict atomic barrier.
+  bridged** — Kinesis retention is 24 hours (extendable to 7 days).
 - **One source feeds one target per consumer process.** Fan-out to multiple
   targets means running multiple processes.
-- **No HTTPS admin surface** — all operator actions are CLI-driven.
+- **No HTTPS admin surface** — all operator actions are CLI-driven
+  (`migrate`, `consume`, `healthz`).
 - **Source Kinesis stream's KMS encryption** is a one-time operator step on
   prod cutover, not a CDK takeover, because changing stream encryption
   affects every producer and consumer of the stream.
@@ -412,6 +413,19 @@ over-provisioning, not runaway.
 Each of these is a design iteration driven by an observed failure, not an a
 priori preference. They are the parts of the design most worth challenging.
 
+0. **(2026-11) Transaction reassembly + ordering buffer + DLQ fence → row-level LWW only.**
+   A design review with Caleb Bitting (DSQL service team) established that
+   Kinesis cannot preserve DSQL transaction order across shards. The
+   cross-shard reassembler plus ordering-buffer watermark gate plus DLQ
+   fence had always been producing an answer against a `CompletedTransaction`
+   whose records had no cross-shard ordering at the source, and the
+   watermark could release transactions before every older-`ts_ns` record
+   had arrived. The LWW stamp was absorbing the resulting out-of-order
+   releases regardless. The reversal: remove the three subsystems (~1600
+   lines of code, 10 tests, 2 CloudWatch alarms, 1 SNS topic, a CLI subgroup,
+   and 3 target-DSQL tables), accept honest row-level eventual consistency,
+   document the "coffee / dinner" case loudly.
+
 1. **Global timestamp ordering → per-key stripe-locked apply.** A 15-minute
    100 TPS load test proved the serial-applier ceiling at ~5–7 DMLs/sec on
    cross-region commits. Insufficient for any real OLTP workload. The
@@ -422,13 +436,17 @@ priori preference. They are the parts of the design most worth challenging.
    design kept checkpoints and watermark state in DynamoDB and only moved
    DLQ into target DSQL. That contradicted "state lives where the applier
    runs" and introduced cross-service consistency logic. The reversal
-   consolidated to six tables in the target cluster.
+   consolidated to target DSQL; the 2026-11 simplification then shrank
+   the state plane to three tables (LWW stamps, checkpoints, shard
+   leases).
 
-3. **Narrower task role → kept the slightly broader DLQ permission.** A
-   stricter "list-only" variant for the DLQ SNS topic tripped the ECS
+3. **Narrower task role → kept the slightly broader DLQ permission → removed with the DLQ.**
+   A stricter "list-only" variant for the DLQ SNS topic tripped the ECS
    deployment circuit breaker during the rollout window where the new
-   (narrower) task role rolled out before the new image. The idempotent
-   create permission is kept because tightening it broke rolling deploys.
+   (narrower) task role rolled out before the new image; the idempotent
+   create permission was kept because tightening it broke rolling deploys.
+   The DLQ topic and its IAM statement were then removed outright in Nov
+   2026 along with the fence.
 
 4. **Applier-only reconnect → every long-lived connection reconnects.** A
    500 TPS stress test exposed that the state connection wedged silently
@@ -439,6 +457,17 @@ priori preference. They are the parts of the design most worth challenging.
 
 ---
 
+## Historical design evolution (pre-2026-11 simplification)
+
+> The sections below are preserved for context on how the design arrived at
+> row-level LWW. They describe subsystems that were removed in Nov 2026
+> (cross-shard transaction reassembler, ordering buffer with watermark gate,
+> DLQ fence) and tables that have been renamed or dropped
+> (`__replicator_lww_stamps` → `__replicator_lww_stamps`;
+> `__replicator_late_discards`, `__replicator_dlq_*`, and
+> `__replicator_watermark_state` are gone). Treat them as release notes, not
+> current design.
+
 ## 2026-10-26 — Measurement, incidents, and the applier ceiling
 
 ### What landed this day
@@ -448,10 +477,12 @@ priori preference. They are the parts of the design most worth challenging.
    across every open shard, so each per-shard reassembler timed out with
    `buffered < expected`. Fix: one process-global reassembler plus a dedicated
    sweeper task that emits `TxnTimeouts` so this failure mode is never silent.
+   *(Both the reassembler and the TxnTimeouts metric were removed in Nov 2026.)*
 2. **Micro-batching (pattern A)** (`6187127`): `Applier.apply_batch(N)` packs N
    source txns into one target `BEGIN...COMMIT`. Config knobs
-   `BATCH_MAX_TXNS` / `BATCH_MAX_WAIT_MS`. Fence/DLQ granularity stays
-   per-source-txn via a per-txn fallback on batch failure.
+   `BATCH_MAX_TXNS` / `BATCH_MAX_WAIT_MS`. *(Still present post-simplification;
+   `apply_batch` now takes a list of `ReadyRecord` instead of
+   `CompletedTransaction`.)*
 3. **Multi-process supervisor (pattern C)** (`6187127`): `REPLICATOR_PROCESSES`
    spawns N child consumer processes; children race for shard leases via the
    existing table. CDK bumped 4 vCPU / 8 GB → 8 vCPU / 16 GB.
@@ -609,7 +640,7 @@ Both failure modes end in silent per-key divergence.
 The bookkeeping table is now:
 
 ```sql
-CREATE TABLE __replicator_applied_v2 (
+CREATE TABLE __replicator_lww_stamps (
     schema_name   text   NOT NULL,
     table_name    text   NOT NULL,
     pk            text   NOT NULL,  -- JSON array of PK columns
@@ -623,13 +654,13 @@ Per-record application does a **conditional UPSERT** inside the same
 target transaction as the row DML:
 
 ```sql
-INSERT INTO __replicator_applied_v2
+INSERT INTO __replicator_lww_stamps
     (schema_name, table_name, pk, applied_ts_ns)
 VALUES ($s, $t, $pk, $ts)
 ON CONFLICT (schema_name, table_name, pk) DO UPDATE
     SET applied_ts_ns = EXCLUDED.applied_ts_ns,
         applied_at    = now()
-    WHERE __replicator_applied_v2.applied_ts_ns < EXCLUDED.applied_ts_ns;
+    WHERE __replicator_lww_stamps.applied_ts_ns < EXCLUDED.applied_ts_ns;
 ```
 
 The applier checks `cur.rowcount`:
@@ -670,7 +701,7 @@ latest `ts_ns`.
   wider row and a WHERE clause but still single-roundtrip inside the
   batch's target transaction).
 
-- `__replicator_applied_v2` grows with the count of **distinct keys ever
+- `__replicator_lww_stamps` grows with the count of **distinct keys ever
   touched**, not the count of txns. For most workloads this is strictly
   smaller than the old table and bounded by the user's row count. A
   TTL / periodic compaction job can prune ancient entries without
@@ -721,7 +752,7 @@ The 2026-10-26 LWW bundle therefore also added:
 
 **Implementation note:** when the LWW stamp's `WHERE` gate rejects the
 UPSERT, `_stamp()` does one extra `SELECT applied_ts_ns FROM
-__replicator_applied_v2 WHERE …` to recover the stored value. This lets
+__replicator_lww_stamps WHERE …` to recover the stored value. This lets
 the caller distinguish `stored_ts > incoming_ts` (late discard, logged
 and persisted) from `stored_ts == incoming_ts` (crash-replay dedup,
 counted but not persisted — the record was already applied under its

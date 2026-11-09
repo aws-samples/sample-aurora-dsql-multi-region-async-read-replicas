@@ -2,10 +2,10 @@
 
 CDK Python app that deploys the replicator as a single ECS Fargate service in
 the control region. The CDK stack owns compute, encryption, alarms, VPC, and
-both SNS topics. The CloudWatch dashboard is upserted via
+the alarms SNS topic. The CloudWatch dashboard is upserted via
 `dsql-replicator migrate` (one-shot). The replicator's own state plane
-(idempotency stamps, fences, checkpoints, shard leases) lives in the target
-DSQL cluster — nothing in DynamoDB.
+(LWW stamps, checkpoints, shard leases) lives in the target DSQL cluster —
+nothing in DynamoDB.
 
 ## Stack contents
 
@@ -20,9 +20,9 @@ DSQL cluster — nothing in DynamoDB.
 - IAM task role (least-privilege) + ECS task-exec role
 - Fargate task definition and service (`desiredCount=1`, deployment circuit
   breaker on, no public IP)
-- Customer-managed KMS CMK + two SNS topics (DLQ events, alarms)
-- Five CloudWatch alarms (apply failures, open fence, ordering buffer, lag,
-  Kinesis records-behind-latest)
+- Customer-managed KMS CMK + one SNS topic (alarms)
+- Three CloudWatch alarms: ApplyQueueNearCap, ReplicationLag,
+  KinesisMillisBehindLatest
 
 ## Prereqs
 
