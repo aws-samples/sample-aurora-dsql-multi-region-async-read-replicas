@@ -24,7 +24,7 @@ async def test_put_batch_single_call_shape() -> None:
     emitter._client = client  # type: ignore[assignment]
     points = [
         MetricPoint("RecordsReceived", 7, "Count", (("Stream", "s1"),)),
-        MetricPoint("WatermarkLagMs", 123.4, "Milliseconds", (("Stream", "s1"),)),
+        MetricPoint("ReplicationLagMs", 123.4, "Milliseconds", (("Stream", "s1"),)),
     ]
     await emitter.put_batch(points)
     assert client.put_metric_data.call_count == 1

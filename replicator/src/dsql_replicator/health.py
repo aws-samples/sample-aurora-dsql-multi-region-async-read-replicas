@@ -1,13 +1,12 @@
 """Health probes used by `dsql-replicator healthz` and the Fargate HEALTHCHECK.
 
-Three probes, each returning (ok: bool, detail: str):
+Two probes, each returning (ok: bool, detail: str):
 
 1. Target DSQL — connect + SELECT 1 (also exercises IAM token generation).
-2. SNS — resolve the DLQ events topic (verifies KMS-encrypted topic is reachable).
-3. Pipeline liveness — reads `/tmp/dsql-replicator-liveness` mtime. The running
+2. Pipeline liveness — reads `/tmp/dsql-replicator-liveness` mtime. The running
    pipeline's metrics loop touches this file every `METRICS_INTERVAL_MS`. A stale
-   file (> `LIVENESS_MAX_AGE_SEC`) means the pipeline is wedged even if AWS probes
-   succeed. Added M6.4+ after a token-expiry wedge was found during 500 TPS stress.
+   file (> `LIVENESS_MAX_AGE_SEC`) means the pipeline is wedged even if the DSQL
+   probe still passes.
 
 Each probe is bounded by a short timeout so a hung dependency doesn't wedge the
 container healthcheck. Overall exit code: 0 if ALL checks pass, 1 otherwise.
@@ -21,9 +20,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-import boto3
 import psycopg
-from botocore.exceptions import BotoCoreError, ClientError
 
 from dsql_replicator.applier.connection import (
     DsqlEndpoint,
@@ -61,19 +58,6 @@ async def _probe_dsql(cfg: Config) -> ProbeResult:
         return ProbeResult("dsql", False, f"query failed: {exc}")
     finally:
         await conn.close()
-
-
-def _probe_sns(cfg: Config) -> ProbeResult:
-    client = boto3.client("sns", region_name=cfg.control_region)
-    try:
-        # create_topic is idempotent and returns the existing ARN unchanged (does not
-        # modify KMS attributes). CDK owns topic creation + KMS; this probe just verifies
-        # reachability + ARN resolution.
-        resp = client.create_topic(Name=cfg.dlq_sns_topic_name)
-        client.get_topic_attributes(TopicArn=resp["TopicArn"])
-        return ProbeResult("sns", True, f"topic {cfg.dlq_sns_topic_name} ok")
-    except (ClientError, BotoCoreError) as exc:
-        return ProbeResult("sns", False, f"topic probe failed: {exc}")
 
 
 def _check_liveness_file(path: Path) -> tuple[bool, str]:
@@ -129,9 +113,8 @@ def _probe_liveness(_: Config) -> ProbeResult:
 async def run_healthz(cfg: Config) -> list[ProbeResult]:
     """Run all probes concurrently and return the result list."""
     dsql_task = asyncio.create_task(_probe_dsql(cfg))
-    sns_task = asyncio.to_thread(_probe_sns, cfg)
     liveness_task = asyncio.to_thread(_probe_liveness, cfg)
-    results = await asyncio.gather(dsql_task, sns_task, liveness_task)
+    results = await asyncio.gather(dsql_task, liveness_task)
     return list(results)
 
 

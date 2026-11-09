@@ -12,7 +12,6 @@ import click
 from . import consumer, health, logging_setup, migrate, preflight
 from .config import Config
 from .errors import ReplicatorError
-from .ops.commands import ops as ops_group
 
 
 @click.group()
@@ -87,9 +86,6 @@ def healthz_cmd() -> None:
         marker = "ok" if r.ok else "FAIL"
         click.echo(f"{marker} {r.name}: {r.detail}")
     sys.exit(0 if all_ok else 1)
-
-
-main.add_command(ops_group)
 
 
 def _load_config() -> Config:

@@ -41,16 +41,6 @@ def _int(name: str, default: int) -> int:
         raise ConfigError(f"invalid int for {name}: {raw!r}") from exc
 
 
-def _bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    v = raw.strip().lower()
-    if v in {"true", "1", "yes", "on"}:
-        return True
-    if v in {"false", "0", "no", "off"}:
-        return False
-    raise ConfigError(f"invalid bool for {name}: {raw!r}")
 
 
 @dataclass(frozen=True)
@@ -72,24 +62,15 @@ class Config:
     sns_topic_arn: str | None
     control_region: str
 
-    # Reassembly / ordering (milliseconds)
-    txn_assembly_timeout_ms: int
+    # Reassembly (fragment only — transaction reassembly removed in the 2026-11
+    # simplification pass). `ordering_buffer_max_depth` is reused as the apply
+    # queue bound so operator-set backpressure values keep working.
     fragment_timeout_ms: int
     ordering_buffer_max_depth: int
-    watermark_idle_shard_timeout_ms: int
-    watermark_clock_skew_budget_ms: int
 
     # Apply
-    apply_max_retries: int
     apply_backoff_initial_ms: int
     checkpoint_flush_interval_ms: int
-
-    # DLQ
-    quarantine_hard_cap: int
-    dlq_fence_pause_on_open: bool
-    dlq_sns_topic_name: str
-    fence_poll_interval_ms: int
-    require_skip_second_approval: bool
 
     # Shard leases (M4)
     task_id: str
@@ -154,19 +135,10 @@ class Config:
             resource_prefix=_optional("RESOURCE_PREFIX", "dsql-replicator"),
             sns_topic_arn=os.environ.get("SNS_TOPIC_ARN") or None,
             control_region=_optional("CONTROL_REGION", source_region),
-            txn_assembly_timeout_ms=_int("TXN_ASSEMBLY_TIMEOUT_MS", 60_000),
             fragment_timeout_ms=_int("FRAGMENT_TIMEOUT_MS", 120_000),
             ordering_buffer_max_depth=_int("ORDERING_BUFFER_MAX_DEPTH", 100_000),
-            watermark_idle_shard_timeout_ms=_int("WATERMARK_IDLE_SHARD_TIMEOUT_MS", 30_000),
-            watermark_clock_skew_budget_ms=_int("WATERMARK_CLOCK_SKEW_BUDGET_MS", 5_000),
-            apply_max_retries=_int("APPLY_MAX_RETRIES", 5),
             apply_backoff_initial_ms=_int("APPLY_BACKOFF_INITIAL_MS", 100),
             checkpoint_flush_interval_ms=_int("CHECKPOINT_FLUSH_INTERVAL_MS", 1_000),
-            quarantine_hard_cap=_int("QUARANTINE_HARD_CAP", 10_000),
-            dlq_fence_pause_on_open=_bool("DLQ_FENCE_PAUSE_ON_OPEN", default=True),
-            dlq_sns_topic_name=_optional("DLQ_SNS_TOPIC_NAME", "dsql-replicator-dlq-events"),
-            fence_poll_interval_ms=_int("FENCE_POLL_INTERVAL_MS", 5_000),
-            require_skip_second_approval=_bool("REQUIRE_SKIP_SECOND_APPROVAL", default=False),
             task_id=_optional("TASK_ID", _default_task_id()),
             lease_ttl_seconds=_int("LEASE_TTL_SECONDS", 30),
             lease_heartbeat_seconds=_int("LEASE_HEARTBEAT_SECONDS", 10),

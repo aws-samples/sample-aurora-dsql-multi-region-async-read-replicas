@@ -27,8 +27,6 @@ Optional context (defaults in parens):
     target_region           — region of the target DSQL cluster (us-west-2)
     resource_prefix         — name prefix for ECS/log/SNS resources
                               (dsql-replicator)
-    dlq_sns_topic_name      — SNS topic for DLQ fence events
-                              (dsql-replicator-dlq-events)
     alarm_email             — optional email to subscribe to the alarms topic
 """
 
@@ -66,8 +64,6 @@ DsqlReplicatorStack(
     target_cluster_id=target_cluster_id,
     target_region=app.node.try_get_context("target_region") or "us-west-2",
     resource_prefix=app.node.try_get_context("resource_prefix") or "dsql-replicator",
-    dlq_sns_topic_name=app.node.try_get_context("dlq_sns_topic_name")
-    or "dsql-replicator-dlq-events",
     alarm_email=app.node.try_get_context("alarm_email") or None,
 )
 

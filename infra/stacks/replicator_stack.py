@@ -45,7 +45,6 @@ class DsqlReplicatorStack(cdk.Stack):
         target_cluster_id: str,
         target_region: str,
         resource_prefix: str,
-        dlq_sns_topic_name: str,
         source_cluster_id: str | None = None,
         alarm_email: str | None = None,
         **kwargs: object,
@@ -170,54 +169,28 @@ class DsqlReplicatorStack(cdk.Stack):
         # target-DSQL tables bootstrapped by `Applier.start()`. Permission to touch
         # them comes from `dsql:DbConnectAdmin` above.
 
-        # ---- KMS CMK (M6.4) ------------------------------------------------
-        # Encrypts both SNS topics. Task role gets Decrypt + GenerateDataKey so it can
-        # publish to the KMS-encrypted DLQ events topic. DSQL does its own at-rest
-        # encryption with service keys — no CMK work needed there. Kinesis stream
-        # encryption is a one-time operator action (see RUNBOOK) because the stream
-        # was created outside this stack.
+        # ---- KMS CMK ------------------------------------------------------
+        # Encrypts the alarms SNS topic. DSQL does its own at-rest encryption
+        # with service keys — no CMK work needed there. Kinesis stream
+        # encryption is a one-time operator action (see RUNBOOK) because the
+        # stream was created outside this stack.
         kms_key = kms.Key(
             self,
             "ReplicatorKey",
             alias="alias/dsql-replicator",
-            description="CMK for dsql-replicator SNS topics",
+            description="CMK for dsql-replicator alarms SNS topic",
             enable_key_rotation=True,
             removal_policy=cdk.RemovalPolicy.RETAIN,
         )
         kms_key.grant_encrypt_decrypt(task_role)
 
-        # ---- SNS DLQ events topic (M6.4 — referenced, not owned by CDK) ---
-        # The topic was created by `migrate` originally and is used by the long-running
-        # task. We reference it by ARN rather than owning it in CFN to avoid a
-        # delete+recreate cycle on deploy. KMS encryption is applied once via
-        # `aws sns set-topic-attributes` as a one-time operator step (see RUNBOOK).
-        dlq_events_topic_arn = (
-            f"arn:aws:sns:{source_region}:{self.account}:{dlq_sns_topic_name}"
-        )
-        dlq_events_topic = sns.Topic.from_topic_arn(
-            self, "DlqEventsTopic", topic_arn=dlq_events_topic_arn
-        )
-        # Task role still needs publish — but task role manages this via explicit statement
-        # below (because `grant_publish` on an imported topic doesn't add key grants).
-
-        # CloudWatch metrics (future M5 metrics emission).
+        # CloudWatch metrics (M5 metrics emission).
         task_role.add_to_policy(
             iam.PolicyStatement(
                 sid="CwPutMetrics",
                 actions=["cloudwatch:PutMetricData"],
                 resources=["*"],
                 conditions={"StringEquals": {"cloudwatch:namespace": "DSQLReplicator"}},
-            )
-        )
-
-        # SNS DLQ topic — idempotent CreateTopic (same name = returns existing ARN,
-        # does not modify KMS attributes). The CDK-managed topic above pins KMS and
-        # ownership; this permission is for the DlqWriter's startup ARN-resolution.
-        task_role.add_to_policy(
-            iam.PolicyStatement(
-                sid="SnsDlqPublish",
-                actions=["sns:Publish", "sns:GetTopicAttributes", "sns:CreateTopic"],
-                resources=[dlq_events_topic.topic_arn],
             )
         )
 
@@ -263,7 +236,6 @@ class DsqlReplicatorStack(cdk.Stack):
                 "TARGET_CLUSTER_ID": target_cluster_id,
                 "TARGET_REGION": target_region,
                 "RESOURCE_PREFIX": resource_prefix,
-                "DLQ_SNS_TOPIC_NAME": dlq_sns_topic_name,
                 "CONTROL_REGION": source_region,
                 "LOG_LEVEL": "INFO",
                 # M7.0c: 2 child processes, each 128 workers / 512 stripes. Total
@@ -318,9 +290,7 @@ class DsqlReplicatorStack(cdk.Stack):
             service_name="dsql-replicator",
         )
 
-        # ---- Alarm SNS topic (M5 + M6.4 KMS + M6.5 subscription) -----------
-        # Separate from the DLQ events topic so operator paging / on-call rules can
-        # subscribe only to alarms without being noisy for every DLQ open/close.
+        # ---- Alarm SNS topic (operator paging / on-call) -------------------
         alarm_topic = sns.Topic(
             self,
             "AlarmsTopic",
@@ -376,36 +346,29 @@ class DsqlReplicatorStack(cdk.Stack):
             a.add_ok_action(alarm_action)
             return a
 
-        # Five alarms per M5.4. Thresholds tuned for a single-shard, ~2-TPS applier.
+        # Post-2026-11 simplification: no fence / no ordering buffer / no
+        # synthetic watermark, so the alarms that gated on those metrics are
+        # gone. Row-level LWW is still visible operationally through
+        # replication lag, apply queue depth, and raw Kinesis lag.
         _alarm(
-            "ApplyErrors",
-            _metric("ApplyErrors"),
-            threshold=1,
-            evaluation_periods=5,
-            datapoints_to_alarm=1,
-            description="Any apply failure in the last 5 min. Investigate immediately.",
-        )
-        _alarm(
-            "OpenFence",
-            _metric("OpenFenceCount", stat="Maximum"),
-            threshold=1,
-            evaluation_periods=5,
-            datapoints_to_alarm=1,
-            description="A DLQ fence is open — forward progress halted. Operator action required.",
-        )
-        _alarm(
-            "OrderingBufferNearCap",
-            _metric("OrderingBufferDepth", stat="Maximum"),
+            "ApplyQueueNearCap",
+            _metric("ApplyQueueDepth", stat="Maximum"),
             threshold=80_000,
             evaluation_periods=5,
-            description="Ordering buffer >80k entries (cap 100k). Applier can't keep up; backpressure imminent.",
+            description=(
+                "Apply queue >80k entries (cap 100k). Apply workers can't keep up with "
+                "the shard workers; backpressure imminent."
+            ),
         )
         _alarm(
-            "WatermarkLag",
-            _metric("WatermarkLagMs", unit=cw.Unit.MILLISECONDS, stat="Average"),
+            "ReplicationLag",
+            _metric("ReplicationLagMs", unit=cw.Unit.MILLISECONDS, stat="Average"),
             threshold=10_000,
             evaluation_periods=5,
-            description="Watermark >10s behind wall clock. Ordering gate is stale; check shards for stalls.",
+            description=(
+                "Newest applied source commit is >10s stale against wall clock. "
+                "Check the apply queue and target DSQL health."
+            ),
         )
         _alarm(
             "KinesisMillisBehindLatest",
@@ -421,5 +384,4 @@ class DsqlReplicatorStack(cdk.Stack):
         cdk.CfnOutput(self, "LogGroupName", value=log_group.log_group_name)
         cdk.CfnOutput(self, "ClusterName", value=cluster.cluster_name)
         cdk.CfnOutput(self, "AlarmsTopicArn", value=alarm_topic.topic_arn)
-        cdk.CfnOutput(self, "DlqEventsTopicArn", value=dlq_events_topic_arn)
         cdk.CfnOutput(self, "KmsKeyArn", value=kms_key.key_arn)
