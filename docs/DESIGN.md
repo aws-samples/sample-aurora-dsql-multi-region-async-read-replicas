@@ -5,6 +5,54 @@ A prose-only companion to `OVERVIEW.md` (what it does) and `ARCHITECTURE.md`
 behind the implementation, the alternatives they rule out, and the trade-offs
 they accept.
 
+> **2026-11 simplification pass.** Sections 3.1 (cross-shard transaction
+> reassembly), 3.2 (ordering buffer + watermark gate), and 3.7 (DLQ fence)
+> describe the historical design. They were removed in the Nov 2026
+> simplification pass after a design review with the DSQL service team
+> established that Kinesis cannot preserve DSQL transaction order across
+> shards — so that machinery never actually delivered the transactional
+> guarantee its name implied. The replicator now applies **row-level
+> last-writer-wins** only, retries transient failures forever, and does
+> not fence. The historical sections are kept for context; see
+> "Row-level eventual consistency" below and "Known limits" for the
+> current contract.
+
+---
+
+## 1a. Row-level eventual consistency (current contract)
+
+The applier commits each record in isolation. For every record it upserts the
+row and bumps a `(schema, table, pk, applied_ts_ns)` stamp in
+`__replicator_lww_stamps`, gated by
+`WHERE EXCLUDED.applied_ts_ns > existing.applied_ts_ns`. The stamp advance
+and the row DML live in the **same** target DSQL transaction, so a crash
+during apply either rolls both back or commits both.
+
+**What this guarantees.** For any primary key, the replica eventually
+converges to the newest source `ts_ns`. Late-arriving older commits for the
+same key are rejected by the stamp gate. Duplicate redeliveries are either
+rejected (same stamp) or re-applied idempotently (same row contents).
+
+**What this does NOT guarantee.** Cross-row invariants held by a single
+source transaction can be observed violated on the replica. The replica may
+briefly expose a state that **never existed at the source**.
+
+**Caleb's coffee / dinner example.** Suppose a source transaction `T1` at
+`ts_ns = 1000` writes `coffee.id = 42` and a separate source transaction
+`T2` at `ts_ns = 2000` writes `dinner.id = 7` — two different rows, two
+different source commits. Because Kinesis is unordered across shards, `T2`'s
+record can arrive and apply on the replica before `T1`'s does. During that
+window the replica shows `(coffee = original_value, dinner = T2_value)` —
+a pair that was never visible at the source. When `T1`'s record eventually
+arrives, the replica advances `coffee = T1_value` and the state is
+consistent again.
+
+If your application needs a cross-row read-after-commit guarantee (foreign
+keys that reference a just-inserted parent, denormalized aggregates derived
+from multiple rows, "if row A looks like X then row B must look like Y"
+checks), **read from the source region.** The replica is for
+eventual-convergence read workloads that tolerate short-lived skew.
+
 ---
 
 ## 1. The problem
@@ -38,20 +86,19 @@ so customers do not have to re-derive these trade-offs.
 - Mirrors committed row changes from one Aurora DSQL cluster to another
   DSQL cluster in a different region (or stage), asynchronously, with
   seconds of lag under normal load.
-- Reassembles each source transaction completely before anything downstream
-  sees it. Target readers never observe partial transactions.
-- Guarantees exactly-once effect under replay. Duplicate deliveries,
-  consumer restarts, and operator retries produce the same target state.
-- Preserves per-row commit order. Two transactions touching the same row
-  commit in source order; two transactions on disjoint rows may commit
-  concurrently.
-- Routes permanently-failing transactions to a durable fence stored in the
-  target cluster. Forward progress halts cleanly until an operator inspects,
-  retries, or explicitly skips.
+- Guarantees row-level **eventual** convergence per primary key via the
+  LWW stamp (see §1a above). Duplicate deliveries, consumer restarts, and
+  late-arriving older commits all land on the same target state.
+- Preserves per-row commit order. Two source commits touching the same row
+  apply in `ts_ns` order; two commits on disjoint rows may apply in any
+  order on the replica (see §1a).
+- Retries transient apply failures indefinitely with exponential backoff.
+  A persistent target-side defect blocks only its own stripe locks, so
+  other keys keep flowing.
 - Fails over cleanly between consumer processes via a shard lease with a
   fencing token and a heartbeat.
-- Publishes throughput, lag, buffer depth, fence state, and per-shard Kinesis
-  lag to CloudWatch with a dashboard and five alarms.
+- Publishes throughput, replication lag, apply-queue depth, and per-shard
+  Kinesis lag to CloudWatch with a dashboard and alarms.
 - Deploys as a single container on AWS Fargate with one command, encrypted at
   rest, under a least-privilege IAM role.
 
@@ -59,9 +106,12 @@ so customers do not have to re-derive these trade-offs.
 
 - Replicate DDL — the operator applies schema changes to both clusters out of
   band.
-- Preserve cross-row application-level atomicity across the replica (a
-  two-account money transfer is not atomic from the replica's view). This
-  matches standard CDC behavior.
+- Preserve **cross-row** application-level atomicity across the replica.
+  A multi-row source transaction (two-account transfer, parent + child
+  insert, denormalized aggregate) can be observed partially-applied on the
+  replica between its row commits. See §1a and "Known limits".
+- Reassemble a source transaction before apply. Rows are applied as they
+  arrive; the per-key LWW stamp is the only correctness primitive.
 - Resolve conflicts against writes made on the target cluster.
 - Filter or transform rows.
 - Provide an HTTPS admin surface — all operator actions are CLI-driven.

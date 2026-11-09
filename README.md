@@ -1,17 +1,43 @@
 # Aurora DSQL Multi-Region Async Replicator
 
 A Python + CDK + Fargate reference implementation that reads Aurora DSQL CDC
-from Kinesis in one region and applies it atomically to a target DSQL cluster
-in another region.
+from Kinesis in one region and applies it to a target DSQL cluster in another
+region with **row-level eventual consistency**.
 
-Correctness-first: per-transaction reassembly, cross-shard global
-transaction reassembly, per-key last-writer-wins via a `(schema, table, pk,
-applied_ts_ns)` stamp table in the target cluster (absorbs at-least-once
-CDC redelivery and late-arriving older txns), durable DLQ fence on apply
-failure, fencing-token lease for clean failover. Scales within a single
-Fargate task via per-key stripe-locked parallel apply + micro-batching
-(128 workers / 8192 stripes / BATCH_MAX_TXNS=2 at the current shape) and
-multi-process children (`REPLICATOR_PROCESSES=2`) for GIL relief.
+Each record upserts the row and bumps a `(schema, table, pk, applied_ts_ns)`
+stamp in `__replicator_lww_stamps`, gated by
+`WHERE EXCLUDED.applied_ts_ns > existing.applied_ts_ns`. Rows converge to
+the newest source commit per primary key; cross-row transactional invariants
+are **not** preserved on the replica. Scales within a single Fargate task
+via per-key stripe-locked parallel apply (128 workers / 8192 stripes),
+infinite retry on transient apply failure, fencing-token lease for clean
+failover, and multi-process children (`REPLICATOR_PROCESSES=2`) for GIL
+relief.
+
+### Row-level eventual consistency (what this means in practice)
+
+Kinesis does not preserve DSQL transaction order across shards. The old
+cross-shard reassembly + ordering buffer + DLQ fence machinery looked like
+it provided transactional consistency on the replica but did not — it
+could still release a transaction before every older-ts_ns record had
+arrived, and the per-key LWW stamp was doing the real work anyway. The
+2026-11 simplification pass removed that machinery and made the semantic
+honest.
+
+**Caleb's coffee / dinner example.** Suppose source transaction T1 writes
+row `coffee.id = 42` (ts_ns = 1000) and T2 writes row `dinner.id = 7`
+(ts_ns = 2000) — two separate rows, two separate source commits. Kinesis
+can deliver T2's record before T1's. The replica will briefly show
+`(coffee@original, dinner@T2)` — a state that **never existed at the
+source** — until T1's record arrives and advances `coffee.id = 42`.
+
+The guarantee is: for any primary key, the replica eventually converges
+to the newest source `ts_ns`. The non-guarantee is: cross-row invariants
+held by a source transaction (foreign keys that reference newly-inserted
+parents, denormalized aggregates, "if X then Y" multi-row conditions)
+can be observed violated on the replica between the time one row applies
+and the other does. If your application needs those, read from the
+source region.
 
 ---
 
@@ -55,19 +81,16 @@ multi-process children (`REPLICATOR_PROCESSES=2`) for GIL relief.
 │ ├── README.md
 │ ├── justfile ← dev shortcuts (lint, test, build)
 │ ├── src/dsql_replicator/
-│ │ ├── cli.py ← click entry points: migrate | consume | ops | healthz
+│ │ ├── cli.py ← click entry points: migrate | consume | healthz
 │ │ ├── config.py ← env-driven Config dataclass
 │ │ ├── envelope.py ← CDC envelope parser
-│ │ ├── reassembler/ ← fragment + transaction reassembly
-│ │ ├── ordering/ ← priority queue + per-shard watermark + fence gate
-│ │ ├── applier/ ← stripe-locked parallel apply + schema cache
-│ │ ├── dlq/ ← fence writer + payload (de)serialize
-│ │ ├── state/ ← checkpoints + shard leases + watermark state
+│ │ ├── reassembler/ ← fragment reassembly (>1 MB rows)
+│ │ ├── applier/ ← stripe-locked parallel LWW apply + schema cache
+│ │ ├── state/ ← checkpoints + shard leases
 │ │ ├── consumer/ ← end-to-end pipeline + metrics loop + liveness
 │ │ ├── migrate/ ← CloudWatch dashboard upsert
-│ │ ├── ops/ ← operator CLI subcommands
 │ │ ├── metrics.py ← CloudWatch emitter
-│ │ └── health.py ← healthz probes (DSQL + SNS + liveness file)
+│ │ └── health.py ← healthz probes (DSQL + liveness file)
 │ └── tests/ ← pytest unit tests
 │
 ├── infra/ ← AWS CDK Python deployment
@@ -77,7 +100,7 @@ multi-process children (`REPLICATOR_PROCESSES=2`) for GIL relief.
 │ ├── README.md
 │ └── stacks/
 │ └── replicator_stack.py ← single-stack: VPC + endpoints + NAT + ECR asset +
-│ KMS + 2 SNS topics + 5 alarms + Fargate task + service
+│ KMS + alarms SNS topic + 3 alarms + Fargate task + service
 │
 └── loadtest/ ← all load / test tooling (see loadtest/README.md)
   ├── README.md ← which script for which scenario
@@ -142,6 +165,24 @@ Prereq: Docker Desktop running (CDK builds the image locally).
 
 ## Known limits
 
+- **Row-level, not transaction-level, consistency.** Cross-row invariants
+  held by a single source transaction (foreign keys to a just-inserted
+  parent, denormalized aggregates, "if X then Y" multi-row conditions)
+  can be observed violated on the replica between the application of
+  one row and the other. The replica eventually converges per primary
+  key — rows do, transactions don't. See the "Caleb's coffee / dinner"
+  example above.
+- **Fragments (>1 MB rows) spanning shards can lose a single row on crash
+  before the next source write.** The fragment reassembler is
+  process-global and holds fragments in memory until the main record
+  assembles. A task crash with fragments still buffered loses that row
+  until the next source write to the same primary key, which LWW will
+  then apply. Operationally rare; non-fragmented rows (the vast
+  majority of CDC traffic) are not affected.
+- **Infinite apply retry** burns CPU on a persistent target-side defect
+  (e.g., schema drift). Alarm on `ApplyQueueNearCap` and
+  `ReplicationLag` — a stuck key will show up as a growing queue and
+  stale lag before anything else goes wrong.
 - **`APPLIER_STRIPES` must be ≫ `APPLIER_WORKERS × avg_stripes_per_batch`**
   or workers queue on asyncio stripe locks and the applier floor collapses
   to the serial RTT. Rule of thumb: `STRIPES ≥ 64 × WORKERS`. CDK default
