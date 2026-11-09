@@ -76,7 +76,7 @@ log = structlog.get_logger("consumer")
 class _QueueItem:
     """A record waiting in the apply queue, tagged with its origin shard + seq."""
 
-    __slots__ = ("record", "shard_id", "seq_str", "enqueued_mono")
+    __slots__ = ("enqueued_mono", "record", "seq_str", "shard_id")
 
     def __init__(self, record: ReadyRecord, shard_id: str, seq_str: str) -> None:
         self.record = record
@@ -302,7 +302,7 @@ class ConsumerPipeline:
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval_s)
                 return
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             try:
                 discovered = set(await self._list_shards(kinesis))
@@ -425,7 +425,7 @@ class ConsumerPipeline:
         while not self._stop.is_set():
             try:
                 first = await asyncio.wait_for(self._apply_queue.get(), timeout=0.5)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             batch = [first]
             batch_deadline = time.monotonic() + batch_wait_s
@@ -435,7 +435,7 @@ class ConsumerPipeline:
                     break
                 try:
                     nxt = await asyncio.wait_for(self._apply_queue.get(), timeout=remaining)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     break
                 batch.append(nxt)
 
@@ -529,10 +529,8 @@ class ConsumerPipeline:
         re-fetch on restart idempotent."""
         log.info("checkpoint_flush.start", interval_s=self._checkpoint_flush_interval_s)
         while not self._stop.is_set():
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(self._stop.wait(), timeout=self._checkpoint_flush_interval_s)
-            except asyncio.TimeoutError:
-                pass
             if self._stop.is_set():
                 break
             try:

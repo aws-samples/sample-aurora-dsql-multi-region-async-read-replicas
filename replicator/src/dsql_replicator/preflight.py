@@ -39,7 +39,7 @@ def discover_source_streams(
     cluster_id: str,
     region: str,
     *,
-    client: "DSQLClient | None" = None,
+    client: DSQLClient | None = None,
 ) -> tuple[str, ...]:
     """Return the Kinesis stream names the given DSQL cluster emits CDC to.
 

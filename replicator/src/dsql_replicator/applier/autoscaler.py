@@ -21,8 +21,8 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import structlog
 
@@ -76,7 +76,7 @@ class WorkerAutoscaler:
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._p.tick_s)
                 return
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
             lag = self._lag_ms()
