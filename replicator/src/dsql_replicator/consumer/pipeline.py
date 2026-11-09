@@ -1,41 +1,46 @@
-"""End-to-end consumer pipeline (single stream, M1 + M3).
+"""Row-level consumer pipeline (post-2026-11 simplification pass).
 
-Flow per shard:
+Per-shard flow:
 
     Kinesis GetRecords
         │  bytes
         v
-    envelope.parse                   ← EnvelopeError → log + skip (DLQ in M3+)
+    envelope.parse                   ── EnvelopeError → log + skip
         │  CdcRecord
         v
-    FragmentReassembler.ingest       ← CrcMismatch / sweep timeouts → log + skip
-        │  Full | AssembledRecord | None
+    FragmentReassembler.ingest       ── CrcMismatch / sweep timeouts → log + skip
+        │  ReadyRecord (FullRecord | AssembledRecord) | None
         v
-    TransactionReassembler.ingest    ← sweep timeouts → log + skip
-        │  CompletedTransaction | None
+    apply queue (shared across shards)
+        │
         v
-    OrderingBuffer.ingest            ← BackpressureError → brief sleep + retry
+    apply workers → Applier.apply_batch(records, pre_commit_hook=checkpoint)
 
-A single apply-runner task drains the ordering buffer in `source.ts_ns` order and hands
-each CompletedTransaction to the serial Applier.
+Design decisions in this pass (see docs/DESIGN.md for the full contract):
 
-M3 — DLQ fence model (operational pause, not a strict `ts_ns` barrier):
-On permanent apply failure, the runner opens a fence in target DSQL (via DlqWriter):
-fence row + full payload row + SNS `opened` notification. `OrderingBuffer.set_fence()`
-halts future releases past the failing `ts_ns`; new records keep flowing in and buffering.
-A separate `_fence_poller` task periodically re-reads `__replicator_dlq_fences`; when the
-oldest OPEN fence is gone (operator ran `ops dlq retry`/`skip`), the in-memory fence is
-cleared and the applier drains the buffered backlog in `ts_ns` order.
+- **No transaction reassembly / no ordering buffer / no DLQ fence.** Kinesis
+  does not preserve DSQL transaction order across shards, so the old
+  machinery delivered no real transactional guarantee. The applier LWW stamp
+  provides per-primary-key eventual convergence; cross-row invariants held
+  by a source transaction can be violated on the replica.
 
-Important: a fence is NOT a strict commit barrier. In-flight apply tasks that were
-dispatched before `fenced.set()` was observed by the apply runner still hold open
-target transactions; their commits can land past `fence_ts_ns`. The fence stops new
-dispatches, not in-flight commits. In practice this gives an operator a reliable
-"stop and look" semantics without us having to add a pre-commit round-trip to every
-batch. See DESIGN.md "Known limits" for the full contract.
+- **Apply retries forever.** No fence, no bad-payload quarantine — a
+  persistent apply failure blocks only its own stripe locks and the pipeline
+  keeps moving on other keys. Operator action is still required to fix a
+  real target-side defect; CloudWatch alarms on `ApplyRetries` surface it.
 
-M1 scope still applies: single source stream, no checkpoint persistence (we always start
-from LATEST). Multi-shard horizontal scaling lands in M4.
+- **Per-shard checkpoints are best-effort.** The shard worker periodically
+  upserts `__replicator_checkpoints` to the latest consumed Kinesis
+  sequence for its own shard. A crash can lose records that were parsed on
+  one shard but not yet applied (e.g. fragments awaiting cross-shard
+  reassembly); LWW makes re-apply idempotent on the next source write that
+  touches the same primary key. Document in README under "Known limits".
+
+Still present (kept intentionally):
+  - Fragment reassembler (handles >1 MB rows that Aurora DSQL splits).
+  - Writer-pool autoscaler driven by replication lag.
+  - Shard leases (single writer per shard) + periodic shard rediscovery.
+  - `__replicator_lww_stamps` table (non-invasive — customer tables untouched).
 """
 
 from __future__ import annotations
@@ -45,7 +50,6 @@ import contextlib
 import os
 import signal
 import time
-from datetime import datetime
 from typing import TYPE_CHECKING, Any
 from uuid import UUID
 
@@ -57,19 +61,28 @@ from dsql_replicator.applier import Applier, ApplyError
 from dsql_replicator.applier.autoscaler import AutoscaleParams, WorkerAutoscaler
 from dsql_replicator.applier.connection import DsqlEndpoint, DsqlTokenCache, open_connection
 from dsql_replicator.config import Config
-from dsql_replicator.dlq import DlqWriter
 from dsql_replicator.envelope import parse
 from dsql_replicator.errors import EnvelopeError, ReplicatorError
 from dsql_replicator.metrics import MetricPoint, MetricsEmitter
-from dsql_replicator.ordering import OrderingBuffer
-from dsql_replicator.ordering.buffer import BackpressureError
-from dsql_replicator.reassembler import CrcMismatchError, FragmentReassembler, TransactionReassembler
-from dsql_replicator.state import CheckpointRepo, LeaseRepo, ShardSeqTracker
+from dsql_replicator.reassembler import CrcMismatchError, FragmentReassembler, ReadyRecord
+from dsql_replicator.state import CheckpointRepo, LeaseRepo
 
 if TYPE_CHECKING:
     pass
 
 log = structlog.get_logger("consumer")
+
+
+class _QueueItem:
+    """A record waiting in the apply queue, tagged with its origin shard + seq."""
+
+    __slots__ = ("record", "shard_id", "seq_str", "enqueued_mono")
+
+    def __init__(self, record: ReadyRecord, shard_id: str, seq_str: str) -> None:
+        self.record = record
+        self.shard_id = shard_id
+        self.seq_str = seq_str
+        self.enqueued_mono = time.monotonic()
 
 
 class ConsumerPipeline:
@@ -89,90 +102,59 @@ class ConsumerPipeline:
         self._start_from_horizon = start_from_horizon
 
         self._stop = asyncio.Event()
-        self._ordering = OrderingBuffer(
-            idle_shard_timeout_seconds=cfg.watermark_idle_shard_timeout_ms / 1000.0,
-            clock_skew_budget_seconds=cfg.watermark_clock_skew_budget_ms / 1000.0,
-            max_depth=cfg.ordering_buffer_max_depth,
-        )
         self._applier = Applier(
             target_endpoint,
-            max_retries=cfg.apply_max_retries,
             backoff_initial_s=cfg.apply_backoff_initial_ms / 1000.0,
             stripe_count=cfg.applier_stripes,
             worker_count=cfg.applier_workers,
             max_worker_count=cfg.applier_workers_max or cfg.applier_workers,
         )
-        self._dlq = DlqWriter(cfg, target_endpoint)
-        self._fence_poll_interval_s = cfg.fence_poll_interval_ms / 1000.0
-        # DSQL CDC distributes a single source transaction's records across every open
-        # shard. Reassembly must be process-global, not per-shard, or ~90% of txns on a
-        # multi-shard stream are dropped as `txn.timeout` with `buffered < expected`.
-        # The same cross-shard distribution applies to chunked-record fragments —
-        # fragment.py's module docstring is explicit about this — so the
-        # FragmentReassembler is also process-global. A per-shard FragmentReassembler
-        # silently drops any chunked record whose fragments land on different shards.
+        # DSQL CDC distributes a single chunked record's fragments across every
+        # open shard, so the fragment reassembler is process-global.
         self._fragment = FragmentReassembler(
             timeout_seconds=cfg.fragment_timeout_ms / 1000.0,
         )
-        self._txn = TransactionReassembler(
-            timeout_seconds=cfg.txn_assembly_timeout_ms / 1000.0,
-        )
-        self._reassembly_sweep_interval_s = max(
-            0.25,
-            min(cfg.fragment_timeout_ms, cfg.txn_assembly_timeout_ms) / 1000.0 / 4,
-        )
-        # Per-shard in-flight sequence tracker. Powers the pre_commit_hook that
-        # upserts __replicator_checkpoints atomically with the row apply. Prior
-        # to this, a timer-based flush could advance the checkpoint past
-        # records still buffered in reassembly, losing them on crash. See
-        # review doc issue #1.
-        self._seq_tracker = ShardSeqTracker()
-        # Expose stream_name for the multi-stream orchestrator in consumer/__init__.py.
+        self._reassembly_sweep_interval_s = max(0.25, cfg.fragment_timeout_ms / 1000.0 / 4)
         self.stream_name = stream_name
 
-        # State plane (M4): own connection for CheckpointRepo + LeaseRepo. Writes are
-        # low-frequency (1 upsert per shard every ~1s + heartbeat every 10s) so a single
-        # shared connection with a lock is cheaper than one per shard.
+        # Shared apply queue drained by apply workers. Bounded so a stall in
+        # the apply pool exerts backpressure on the shard workers.
+        self._apply_queue: asyncio.Queue[_QueueItem] = asyncio.Queue(
+            maxsize=cfg.ordering_buffer_max_depth
+        )
+
+        # Per-shard checkpoint bookkeeping: the max consumed Kinesis seq seen
+        # on each shard, plus the last value we persisted (so the flush task
+        # only writes when it strictly advances).
+        self._shard_max_consumed: dict[str, str] = {}
+        self._shard_last_flushed: dict[str, str] = {}
+
+        # State plane: own connection for CheckpointRepo + LeaseRepo.
         self._state_token_cache = DsqlTokenCache(target_endpoint)
         self._state_conn: psycopg.AsyncConnection[tuple[object, ...]] | None = None
         self._state_lock = asyncio.Lock()
         self._task_id = cfg.task_id
         self._lease_ttl_s = cfg.lease_ttl_seconds
         self._lease_heartbeat_s = cfg.lease_heartbeat_seconds
-        # Timer-based checkpoint flush was removed in M6.5 (review doc issue #1);
-        # checkpoint advance is now atomic with apply via `_make_checkpoint_hook`.
-        # `checkpoint_flush_interval_ms` is still read for backwards-compatible
-        # config parsing; the value is intentionally unused.
-        _ = cfg.checkpoint_flush_interval_ms
+        self._checkpoint_flush_interval_s = max(0.25, cfg.checkpoint_flush_interval_ms / 1000.0)
 
-        # Running counters surfaced to logs. CloudWatch wiring lands in M5.
+        # Running counters surfaced to logs + CloudWatch.
         self.records_received = 0
-        self.transactions_committed = 0
-        self.rows_replicated = 0
-        self.rows_deduped = 0
-        # Rows the LWW stamp rejected because an older `t_commit` arrived
-        # after a newer one had already been applied for the same key.
-        # Counted + persisted to `__replicator_late_discards` on the apply
-        # side; emitted as the `RowsLateDiscarded` CloudWatch metric so
-        # dashboards can distinguish this from crash-replay dedup and from
-        # genuine apply failures.
-        self.rows_late_discarded = 0
+        self.rows_applied = 0
+        self.rows_discarded = 0
         self.parse_errors = 0
         self.crc_mismatches = 0
         self.fragment_timeouts = 0
-        self.apply_errors = 0
-        self.fences_opened = 0
-        self.fences_closed_observed = 0
+        self.apply_batches = 0
         self.leases_acquired = 0
         self.leases_lost = 0
         self.checkpoints_flushed = 0
-        self.txn_timeouts = 0
-        self.ingest_rejects_recorded = 0
 
-        # M5: metrics. Shard-level state updated by the shard worker.
-        # When running under the multi-process supervisor (`PROCESS_ID` set in each
-        # child), tag emissions with that id so dashboard aggregation can Sum or Avg
-        # across processes and alarms can scope to one child when needed.
+        # Autoscaler lag signal: wall-time age of the newest source ts_ns we
+        # have observed applying. Updated by the apply loop.
+        self._last_applied_source_ts_ns: int = 0
+
+        # Metrics setup.
         process_id = os.environ.get("PROCESS_ID")
         default_dims: tuple[tuple[str, str], ...] = (
             ("TargetCluster", target_endpoint.cluster_identifier or "unknown"),
@@ -194,7 +176,6 @@ class ConsumerPipeline:
         """Run until stop() is called or SIGINT. Returns on clean shutdown."""
         self._install_signal_handlers()
         await self._applier.start()
-        await self._dlq.start()
         self._state_conn = await open_connection(self._target, self._state_token_cache, autocommit=True)
         session = aioboto3.Session()
         try:
@@ -206,20 +187,19 @@ class ConsumerPipeline:
                     shards=len(shards),
                     target_cluster=self._target.cluster_identifier,
                 )
-                # Dict so the discovery loop can diff "shards seen now" against
-                # "shards we've already spawned workers for" and only start
-                # tasks for new shards. Reusing the same spawn path for
-                # startup and for mid-run resharding keeps the invariant that
-                # every worker goes through _try_lease — so if two processes
-                # discover a new shard at the same time, only one applies it.
                 worker_tasks: dict[str, asyncio.Task[None]] = {
                     s: asyncio.create_task(self._shard_worker(kinesis, s), name=f"shard:{s}")
                     for s in shards
                 }
-                runner_task = asyncio.create_task(self._apply_runner(), name="apply-runner")
-                fence_task = asyncio.create_task(self._fence_poller(), name="fence-poller")
+                apply_tasks = [
+                    asyncio.create_task(self._apply_worker(i), name=f"apply:{i}")
+                    for i in range(max(1, self._cfg.applier_workers))
+                ]
                 metrics_task = asyncio.create_task(self._metrics_loop(), name="metrics-loop")
                 sweep_task = asyncio.create_task(self._reassembly_sweeper(), name="reassembly-sweeper")
+                checkpoint_task = asyncio.create_task(
+                    self._checkpoint_flush_loop(), name="checkpoint-flush"
+                )
                 discovery_task = asyncio.create_task(
                     self._shard_discovery_loop(kinesis, worker_tasks),
                     name="shard-discovery",
@@ -245,59 +225,51 @@ class ConsumerPipeline:
                 finally:
                     for t in worker_tasks.values():
                         t.cancel()
-                    runner_task.cancel()
-                    fence_task.cancel()
+                    for t in apply_tasks:
+                        t.cancel()
                     metrics_task.cancel()
                     sweep_task.cancel()
+                    checkpoint_task.cancel()
                     discovery_task.cancel()
                     autoscaler_task.cancel()
                     await asyncio.gather(
                         *worker_tasks.values(),
-                        runner_task,
-                        fence_task,
+                        *apply_tasks,
                         metrics_task,
                         sweep_task,
+                        checkpoint_task,
                         discovery_task,
                         autoscaler_task,
                         return_exceptions=True,
                     )
         finally:
             await self._applier.close()
-            await self._dlq.close()
             if self._state_conn is not None and not self._state_conn.closed:
                 await self._state_conn.close()
             self._state_conn = None
             log.info(
                 "consumer.stopped",
                 records=self.records_received,
-                txns=self.transactions_committed,
-                rows=self.rows_replicated,
-                dedup=self.rows_deduped,
+                rows=self.rows_applied,
+                discarded=self.rows_discarded,
                 parse_errors=self.parse_errors,
                 crc_mismatches=self.crc_mismatches,
                 fragment_timeouts=self.fragment_timeouts,
-                apply_errors=self.apply_errors,
-                fences_opened=self.fences_opened,
-                fences_closed_observed=self.fences_closed_observed,
+                apply_batches=self.apply_batches,
                 leases_acquired=self.leases_acquired,
                 leases_lost=self.leases_lost,
                 checkpoints_flushed=self.checkpoints_flushed,
-                txn_timeouts=self.txn_timeouts,
-                ingest_rejects=self.ingest_rejects_recorded,
             )
 
     def stop(self) -> None:
         self._stop.set()
 
     def _current_lag_ms(self) -> float | None:
-        """Writer autoscaler signal: wall-time age of the ordering buffer's
-        committed watermark. Same quantity emitted as the WatermarkLagMs
-        CloudWatch metric, read in-process so the scaler doesn't round-trip
-        through CloudWatch. Returns None before the first watermark advance."""
-        stats = self._ordering.stats()
-        if stats.watermark_ns is None:
+        """Writer autoscaler signal: wall-time age of the newest source
+        ts_ns we've seen apply. None before the first apply."""
+        if self._last_applied_source_ts_ns == 0:
             return None
-        return max(0.0, (time.time_ns() - stats.watermark_ns) / 1e6)
+        return max(0.0, (time.time_ns() - self._last_applied_source_ts_ns) / 1e6)
 
     # ---- shard discovery ------------------------------------------------
 
@@ -321,18 +293,7 @@ class ConsumerPipeline:
     async def _shard_discovery_loop(
         self, kinesis: Any, worker_tasks: dict[str, asyncio.Task[None]]
     ) -> None:
-        """Periodically re-list Kinesis shards and spawn workers for new ones.
-
-        Protects against mid-run resharding (10 shards → 12 shards) silently
-        dropping records on the new shards until the task restarts. Workers
-        for closed/split shards exit on end-of-shard naturally; we prune
-        their entries so the dict only tracks live tasks.
-
-        A completed-not-cancelled entry is also pruned: if a shard we
-        previously saw stops being leased by anyone and the local worker
-        returned, this loop will respawn it next poll and let the lease
-        logic re-decide ownership.
-        """
+        """Periodically re-list Kinesis shards and spawn workers for new ones."""
         interval_s = self._cfg.shard_discovery_interval_ms / 1000.0
         if interval_s <= 0:
             log.info("shard.discovery.disabled", stream=self._stream_name)
@@ -340,14 +301,12 @@ class ConsumerPipeline:
         while not self._stop.is_set():
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=interval_s)
-                return  # stop was set during the wait
+                return
             except asyncio.TimeoutError:
-                pass  # interval elapsed, poll
+                pass
             try:
                 discovered = set(await self._list_shards(kinesis))
             except Exception as exc:
-                # list_shards failures are transient (throttling, cold boto client).
-                # Log and try again next cycle; existing workers keep running.
                 log.warning(
                     "shard.discovery.list_failed",
                     stream=self._stream_name,
@@ -355,7 +314,6 @@ class ConsumerPipeline:
                 )
                 continue
 
-            # Prune workers that have finished (closed shard or lease loss).
             for sid in [s for s, t in worker_tasks.items() if t.done()]:
                 worker_tasks.pop(sid, None)
 
@@ -376,16 +334,14 @@ class ConsumerPipeline:
 
     async def _shard_worker(self, kinesis: Any, shard_id: str) -> None:
         shard_key = f"{self._stream_name}:{shard_id}"
+        _ = shard_key  # dimensional tag reserved for future per-shard metrics
 
-        # M4: steal the lease before doing anything. If someone else owns it, skip.
         lease_token = await self._try_lease(shard_id)
         if lease_token is None:
             log.info("shard.lease.skipped", shard=shard_id, task_id=self._task_id)
             return
         self.leases_acquired += 1
 
-        # M4: resume from stored checkpoint if any; else LATEST (or TRIM_HORIZON if
-        # the operator asked for a full backfill via start_from_horizon).
         iterator, iterator_type, starting_sequence = await self._resolve_iterator(kinesis, shard_id)
         log.info(
             "shard.start",
@@ -395,15 +351,10 @@ class ConsumerPipeline:
             task_id=self._task_id,
         )
 
-        self._ordering.register_shard(shard_key)
-        # NB: fragment AND transaction reassembly are both process-global
-        # (`self._fragment`, `self._txn`) — see __init__ for the why. Sweeps run in
-        # `_reassembly_sweeper`, not here.
-        latest_ts_ns = 0
         lease_lost = asyncio.Event()
         heartbeat_task = asyncio.create_task(
             self._heartbeat_loop(shard_id, lease_token, lease_lost),
-            name=f"heartbeat:{shard_key}",
+            name=f"heartbeat:{shard_id}",
         )
 
         while not self._stop.is_set() and iterator is not None and not lease_lost.is_set():
@@ -419,7 +370,6 @@ class ConsumerPipeline:
             self.records_received += len(records)
             self._shard_state[shard_id] = {
                 "millis_behind_latest": mbl,
-                "latest_ts_ns": latest_ts_ns,
                 "lease_token": lease_token,
                 "last_poll_mono": time.monotonic(),
             }
@@ -427,409 +377,195 @@ class ConsumerPipeline:
             for rec in records:
                 data = rec["Data"]
                 seq = rec.get("SequenceNumber")
-                seq_str = str(seq) if seq is not None else None
+                seq_str = str(seq) if seq is not None else ""
+                if seq_str:
+                    self._shard_max_consumed[shard_id] = seq_str
+
                 try:
                     env = parse(data)
                 except EnvelopeError as exc:
                     self.parse_errors += 1
                     log.warning("parse.failed", shard=shard_id, error=str(exc), head=data[:120])
-                    # Enroll + immediately retire so this seq doesn't block the
-                    # safe-checkpoint computation for the shard. No tx/chunk ids
-                    # are available (parse failed) — retire by seq directly.
-                    if seq_str is not None:
-                        self._seq_tracker.enroll(shard_id=shard_id, seq_str=seq_str)
-                        self._seq_tracker.retire_by_seq(shard_id, seq_str)
-                    await self._record_ingest_reject(
-                        reason="parse_error",
-                        shard_id=shard_id,
-                        error_message=str(exc),
-                        raw_bytes=bytes(data) if isinstance(data, (bytes, bytearray)) else None,
-                    )
                     continue
-
-                # Enroll this record in the per-shard tracker BEFORE handing it
-                # downstream so the safe-checkpoint computation reflects it.
-                if seq_str is not None:
-                    env_tx_id = _tx_id_of(env)
-                    env_record_id = _record_id_of(env)
-                    env_chunk_ids: tuple[str, ...] = tuple(_chunk_ids_of(env))
-                    self._seq_tracker.enroll(
-                        shard_id=shard_id,
-                        seq_str=seq_str,
-                        tx_id=env_tx_id,
-                        record_id=env_record_id,
-                        chunk_ids=env_chunk_ids,
-                    )
 
                 try:
                     ready = self._fragment.ingest(env)
                 except CrcMismatchError as exc:
                     self.crc_mismatches += 1
                     log.warning("fragment.crc_mismatch", shard=shard_id, error=str(exc))
-                    # Retire this bad record's seq so it doesn't gate the checkpoint.
-                    env_cid = _chunk_id_of(env)
-                    env_txid = _tx_id_of(env)
-                    env_rid = _record_id_of(env)
-                    if env_cid:
-                        self._seq_tracker.retire_by_chunk(env_cid)
-                    if env_txid and env_rid:
-                        self._seq_tracker.retire_by_tx_record(env_txid, env_rid)
-                    await self._record_ingest_reject(
-                        reason="crc_mismatch",
-                        shard_id=shard_id,
-                        chunk_id=env_cid,
-                        tx_id=env_txid,
-                        record_id=env_rid,
-                        error_message=str(exc),
-                    )
                     continue
                 if ready is None:
                     continue
 
-                completed = self._txn.ingest(ready)
-                if completed is None:
-                    # Still waiting on other records in this txn — but we can tighten the
-                    # per-shard watermark from the records we have observed so far.
-                    ts = _ts_ns_of_ready(ready)
-                    if ts > latest_ts_ns:
-                        latest_ts_ns = ts
-                    continue
-
-                if completed.ts_ns > latest_ts_ns:
-                    latest_ts_ns = completed.ts_ns
-
-                while True:
-                    try:
-                        self._ordering.ingest(completed)
-                        break
-                    except BackpressureError:
-                        if self._stop.is_set():
-                            break
-                        await asyncio.sleep(0.1)
-
-            # Even on empty batches, keep the watermark fresh so idle shards can advance.
-            self._ordering.update_shard(shard_key, latest_ts_ns=latest_ts_ns, millis_behind_latest=mbl)
-
-            # Fragment and transaction sweeps run globally in `_reassembly_sweeper`
-            # (both reassemblers are process-global) so cross-shard chunks and txns
-            # never get prematurely timed out by a single shard's local timer.
-
-            # M6.5: no more timer-based checkpoint flush. Checkpoint advance is
-            # atomic with apply via `_make_checkpoint_hook` (review doc issue #1).
-            # The old timer path could race ahead of records still buffered in
-            # reassembly and lose them on crash.
+                await self._apply_queue.put(_QueueItem(ready, shard_id, seq_str))
 
             if not records:
                 await asyncio.sleep(0.25)
 
         log.info("shard.stop", shard=shard_id, lease_lost=lease_lost.is_set())
-        self._ordering.forget_shard(shard_key)
-        # Drop any tracker state for this shard — the lease is going away.
-        self._seq_tracker.forget_shard(shard_id)
         heartbeat_task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await heartbeat_task
         if not lease_lost.is_set():
             await self._release_lease(shard_id, lease_token)
 
-    # ---- apply runner ---------------------------------------------------
+    # ---- apply workers --------------------------------------------------
 
-    async def _apply_runner(self) -> None:
-        """Accumulate ready txns into size-or-time batches, dispatch as concurrent
-        batch-apply tasks (bounded by `applier_workers`).
+    async def _apply_worker(self, worker_id: int) -> None:
+        """Drain the apply queue in micro-batches and hand them to the Applier.
 
-        Micro-batching (A) packs up to `batch_max_txns` source txns per cross-region
-        BEGIN..COMMIT; partial batches flush after `batch_max_wait_ms`. Per-key
-        ordering is preserved: within a batch, DMLs run in ts_ns order inside one
-        SQL txn; across batches, stripe locks serialize touching the same key.
-
-        On a non-retryable batch failure, the task falls back to single-txn apply
-        per `self._apply_batch_task`, so fence/DLQ granularity stays per-source-txn.
+        A worker collects up to `batch_max_txns` queue items or waits
+        `batch_max_wait_ms` for a partial flush. Backpressure comes from the
+        queue being empty (worker sleeps) or full (shard workers block on put).
         """
-        log.info(
-            "apply_runner.start",
-            stripes=self._cfg.applier_stripes,
-            workers=self._cfg.applier_workers,
-            batch_max_txns=self._cfg.batch_max_txns,
-            batch_max_wait_ms=self._cfg.batch_max_wait_ms,
-        )
-        sem = asyncio.Semaphore(self._cfg.applier_workers)
-        in_flight: set[asyncio.Task[None]] = set()
-        fenced = asyncio.Event()
-        pending: list[Any] = []  # list[CompletedTransaction]
-        pending_first_mono = 0.0
+        _ = worker_id  # reserved for future per-worker logging
         batch_max = max(1, self._cfg.batch_max_txns)
         batch_wait_s = max(0.0, self._cfg.batch_max_wait_ms / 1000.0)
 
-        async def _dispatch() -> None:
-            nonlocal pending, pending_first_mono
-            if not pending:
-                return
-            batch = pending
-            pending = []
-            pending_first_mono = 0.0
-            await sem.acquire()
-            task = asyncio.create_task(
-                self._apply_batch_task(batch, sem, fenced),
-                name=f"apply_batch:n={len(batch)}",
-            )
-            in_flight.add(task)
-            task.add_done_callback(in_flight.discard)
-
         while not self._stop.is_set():
-            # If a fence has been opened, drain in-flight (and any pending batch) and
-            # wait for the fence poller to clear it.
-            if fenced.is_set():
-                if pending:
-                    # Re-ingest so the ordering buffer can regate under the fence.
-                    for t in pending:
-                        with contextlib.suppress(BackpressureError):
-                            self._ordering.ingest(t)
-                    pending = []
-                    pending_first_mono = 0.0
-                if in_flight:
-                    await asyncio.wait(in_flight, return_when=asyncio.ALL_COMPLETED)
-                    in_flight.clear()
-                await asyncio.sleep(0.05)
-                if self._ordering.fence_ts_ns is None:
-                    fenced.clear()
-                continue
-
-            ready = self._ordering.ready()
-            for completed in ready:
-                if self._stop.is_set() or fenced.is_set():
-                    with contextlib.suppress(BackpressureError):
-                        self._ordering.ingest(completed)
-                    continue
-                if not pending:
-                    pending_first_mono = time.monotonic()
-                pending.append(completed)
-                if len(pending) >= batch_max:
-                    await _dispatch()
-
-            # Time-based flush of a partial batch.
-            if pending and (time.monotonic() - pending_first_mono) >= batch_wait_s:
-                await _dispatch()
-
-            if not ready and not pending:
-                await asyncio.sleep(0.05)
-
-        # Clean shutdown: flush any pending partial batch, then await in-flight.
-        if pending:
-            await _dispatch()
-        if in_flight:
-            await asyncio.wait(in_flight, return_when=asyncio.ALL_COMPLETED)
-        log.info("apply_runner.stop")
-
-    async def _apply_batch_task(
-        self,
-        batch: list[Any],
-        sem: asyncio.Semaphore,
-        fenced: asyncio.Event,
-    ) -> None:
-        """One concurrent batch-apply task.
-
-        Happy path: `Applier.apply_batch(batch)` commits all N source txns in one
-        cross-region transaction. Each result still carries per-txn rows_applied /
-        rows_deduped for metrics.
-
-        Failure path: on `ApplyError`, fall back to per-txn `Applier.apply()`. The
-        bad txn opens a fence at its own ts_ns (unchanged DLQ semantics); earlier
-        txns in the batch still commit; later txns are re-ingested into the
-        ordering buffer so they re-release past the fence.
-        """
-        try:
             try:
-                hook = self._make_checkpoint_hook(batch)
-                results = await self._applier.apply_batch(batch, pre_commit_hook=hook)
-                for completed, result in zip(batch, results, strict=True):
-                    self.transactions_committed += 1
-                    self.rows_replicated += result.rows_applied
-                    self.rows_deduped += result.rows_deduped
-                    self.rows_late_discarded += result.rows_late_discarded
-                    log.info(
-                        "apply.ok",
-                        tx_id=completed.tx_id,
-                        rows=result.rows_applied,
-                        dedup=result.rows_deduped,
-                        attempt=result.attempt,
-                        duration_ms=round(result.duration_ms, 1),
-                        stripes=list(result.stripes),
-                        batched=len(batch),
-                    )
-                return
-            except ApplyError as batch_exc:
-                log.warning(
-                    "apply_batch.failed_falling_back",
-                    size=len(batch),
-                    error=str(batch_exc),
-                )
-            # Per-txn fallback. One commit per txn so the bad txn gets its own fence.
-            for i, completed in enumerate(batch):
+                first = await asyncio.wait_for(self._apply_queue.get(), timeout=0.5)
+            except asyncio.TimeoutError:
+                continue
+            batch = [first]
+            batch_deadline = time.monotonic() + batch_wait_s
+            while len(batch) < batch_max:
+                remaining = batch_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 try:
-                    single_hook = self._make_checkpoint_hook([completed])
-                    result = await self._applier.apply(completed, pre_commit_hook=single_hook)
-                    self.transactions_committed += 1
-                    self.rows_replicated += result.rows_applied
-                    self.rows_deduped += result.rows_deduped
-                    self.rows_late_discarded += result.rows_late_discarded
-                    log.info(
-                        "apply.ok",
-                        tx_id=completed.tx_id,
-                        rows=result.rows_applied,
-                        dedup=result.rows_deduped,
-                        attempt=result.attempt,
-                        duration_ms=round(result.duration_ms, 1),
-                        stripes=list(result.stripes),
-                        single_txn_fallback=True,
-                    )
-                except ApplyError as inner:
-                    self.apply_errors += 1
-                    log.error(
-                        "apply.failed",
-                        tx_id=completed.tx_id,
-                        ts_ns=completed.ts_ns,
-                        error=str(inner),
-                    )
-                    fenced.set()
-                    await self._open_fence(completed, inner)
-                    # Hand remaining txns back to the ordering buffer so they
-                    # re-release once the fence closes.
-                    for r in batch[i + 1 :]:
-                        with contextlib.suppress(BackpressureError):
-                            self._ordering.ingest(r)
-                    return
-        finally:
-            sem.release()
+                    nxt = await asyncio.wait_for(self._apply_queue.get(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+                batch.append(nxt)
 
-    async def _apply_one(
-        self,
-        completed: Any,
-        sem: asyncio.Semaphore,
-        fenced: asyncio.Event,
-    ) -> None:
-        """One concurrent apply task. Releases the semaphore + opens fence on error."""
+            await self._apply_one_batch(batch)
+
+    async def _apply_one_batch(self, batch: list[_QueueItem]) -> None:
+        hook = self._make_checkpoint_hook(batch)
+        records = [it.record for it in batch]
         try:
-            hook = self._make_checkpoint_hook([completed])
-            result = await self._applier.apply(completed, pre_commit_hook=hook)
-            self.transactions_committed += 1
-            self.rows_replicated += result.rows_applied
-            self.rows_deduped += result.rows_deduped
-            self.rows_late_discarded += result.rows_late_discarded
-            log.info(
-                "apply.ok",
-                tx_id=completed.tx_id,
-                rows=result.rows_applied,
-                dedup=result.rows_deduped,
-                late_discarded=result.rows_late_discarded,
-                attempt=result.attempt,
-                duration_ms=round(result.duration_ms, 1),
-                stripes=list(result.stripes),
-            )
+            result = await self._applier.apply_batch(records, pre_commit_hook=hook)
         except ApplyError as exc:
-            self.apply_errors += 1
+            # Non-retryable (schema missing / malformed). Infinite retry
+            # would spin forever on a structural problem; log and drop so
+            # other keys keep flowing. Operator sees ApplyErrors in metrics.
             log.error(
-                "apply.failed",
-                tx_id=completed.tx_id,
-                ts_ns=completed.ts_ns,
+                "apply.structural_failure_dropping",
+                size=len(batch),
                 error=str(exc),
             )
-            fenced.set()
-            await self._open_fence(completed, exc)
-        finally:
-            sem.release()
+            # Still mark the shards' seqs so progress isn't permanently stuck.
+            for it in batch:
+                self._shard_max_consumed[it.shard_id] = max(
+                    self._shard_max_consumed.get(it.shard_id, ""),
+                    it.seq_str,
+                    key=_seq_sort_key,
+                )
+            return
+        self.apply_batches += 1
+        self.rows_applied += result.rows_applied
+        self.rows_discarded += result.rows_discarded
+        # Advance the lag signal to the newest source ts_ns in the batch.
+        for it in batch:
+            ts = _ts_ns_of(it.record)
+            if ts > self._last_applied_source_ts_ns:
+                self._last_applied_source_ts_ns = ts
+        log.info(
+            "apply.ok",
+            size=len(batch),
+            rows=result.rows_applied,
+            discarded=result.rows_discarded,
+            attempt=result.attempt,
+            duration_ms=round(result.duration_ms, 1),
+            stripes=list(result.stripes),
+        )
 
-    def _make_checkpoint_hook(self, batch: list[Any]) -> Any:
-        """Build an applier `pre_commit_hook` that:
-
-        1. Retires each committed record's seq in the per-shard tracker.
-        2. For every shard that advanced, upserts `__replicator_checkpoints`
-           using the SAME cursor the applier is about to COMMIT.
-
-        This replaces the old timer-based `_flush_checkpoint`, which could
-        advance the checkpoint past records still buffered in reassembly and
-        lose them on crash. See review doc issue #1.
-        """
+    def _make_checkpoint_hook(self, batch: list[_QueueItem]) -> Any:
+        """Build an applier pre_commit_hook that upserts `__replicator_checkpoints`
+        for every shard that contributed a record to this batch, using the
+        same cursor the applier is about to COMMIT."""
+        # Collect the max seq per shard in this batch.
+        per_shard_max: dict[str, str] = {}
+        max_ts_ns = 0
+        for it in batch:
+            if not it.seq_str or not it.shard_id:
+                continue
+            cur = per_shard_max.get(it.shard_id, "")
+            per_shard_max[it.shard_id] = (
+                it.seq_str if _seq_sort_key(it.seq_str) > _seq_sort_key(cur) else cur
+            )
+            ts = _ts_ns_of(it.record)
+            if ts > max_ts_ns:
+                max_ts_ns = ts
 
         async def hook(cur: Any) -> None:
-            affected_shards: set[str] = set()
-            batch_latest_ts_ns = 0
-            for completed in batch:
-                for tx_id, record_id in _completed_txn_tx_record_ids(completed):
-                    affected_shards |= self._seq_tracker.retire_by_tx_record(tx_id, record_id)
-                for cid in _completed_txn_chunk_ids(completed):
-                    affected_shards |= self._seq_tracker.retire_by_chunk(cid)
-                ts = int(getattr(completed, "ts_ns", 0))
-                if ts > batch_latest_ts_ns:
-                    batch_latest_ts_ns = ts
-            # Upsert the checkpoint for each affected shard whose safe seq has
-            # advanced. CheckpointRepo.upsert_in_cursor doesn't touch its own
-            # stored conn — only the cursor passed in — so a dummy conn is
-            # fine. We use `cur.connection` so psycopg's cursor machinery is
-            # fully consistent even if a future repo change starts to read
-            # from `self._conn`.
+            if not per_shard_max:
+                return
             repo = CheckpointRepo(cur.connection)
-            for shard_id in affected_shards:
-                safe = self._seq_tracker.safe_checkpoint(shard_id)
-                if safe is None:
-                    continue
-                seq_str, _ = safe
+            for shard_id, seq_str in per_shard_max.items():
                 await repo.upsert_in_cursor(
                     cur,
                     stream_name=self._stream_name,
                     shard_id=shard_id,
                     sequence_number=seq_str,
-                    last_applied_ts_ns=batch_latest_ts_ns,
+                    last_applied_ts_ns=max_ts_ns,
                 )
                 self.checkpoints_flushed += 1
 
         return hook
 
-    async def _record_ingest_reject(
-        self,
-        *,
-        reason: str,
-        shard_id: str | None = None,
-        tx_id: str | None = None,
-        record_id: str | None = None,
-        chunk_id: str | None = None,
-        error_message: str | None = None,
-        raw_bytes: bytes | None = None,
-        details: dict[str, Any] | None = None,
-    ) -> None:
-        """Route an ingest-side reject (parse / CRC / fragment-timeout / txn-timeout)
-        to `__replicator_dlq_ingest` for forensics. Never raises; failures are
-        logged, so a transient DSQL hiccup can't wedge the ingest loop. These
-        rejects are NOT a commit barrier — they never reached the applier."""
-        try:
-            await self._dlq.record_ingest_reject(
-                stream_name=self._stream_name,
-                reason=reason,
-                shard_id=shard_id,
-                tx_id=tx_id,
-                record_id=record_id,
-                chunk_id=chunk_id,
-                error_message=error_message,
-                raw_bytes=raw_bytes,
-                details=details,
-            )
-            self.ingest_rejects_recorded += 1
-        except Exception as exc:
-            log.warning("ingest_reject.route_failed", reason=reason, error=str(exc))
+    # ---- periodic checkpoint flush (shards with no committed records) --
 
-    async def _open_fence(self, completed: Any, exc: BaseException) -> None:
-        try:
-            await self._dlq.open_fence(
-                completed,
-                error_class=type(exc).__name__,
-                failing_sql=str(exc),
-            )
-            self._ordering.set_fence(completed.ts_ns)
-            self.fences_opened += 1
-        except Exception as fence_exc:
-            log.error("fence.open.failed", tx_id=completed.tx_id, error=str(fence_exc))
-            # Fallback: without a durable fence we must halt to avoid silent divergence.
-            self._stop.set()
+    async def _checkpoint_flush_loop(self) -> None:
+        """Periodically upsert the per-shard checkpoint even for shards that
+        did not contribute an applied record recently.
+
+        The in-band hook in `_make_checkpoint_hook` already advances a shard's
+        checkpoint whenever one of its records applies. This loop catches
+        shards whose records are stuck in fragment reassembly (and therefore
+        never reach the apply hook) so a quiet shard's checkpoint still
+        progresses toward its consumed seq. Row-level LWW makes the resulting
+        re-fetch on restart idempotent."""
+        log.info("checkpoint_flush.start", interval_s=self._checkpoint_flush_interval_s)
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=self._checkpoint_flush_interval_s)
+            except asyncio.TimeoutError:
+                pass
+            if self._stop.is_set():
+                break
+            try:
+                await self._flush_pending_checkpoints()
+            except Exception as exc:
+                log.warning("checkpoint_flush.error", error=str(exc))
+        log.info("checkpoint_flush.stop")
+
+    async def _flush_pending_checkpoints(self) -> None:
+        to_flush: list[tuple[str, str]] = []
+        for shard_id, seq_str in list(self._shard_max_consumed.items()):
+            prev = self._shard_last_flushed.get(shard_id, "")
+            if _seq_sort_key(seq_str) > _seq_sort_key(prev):
+                to_flush.append((shard_id, seq_str))
+        if not to_flush:
+            return
+
+        async def body(conn: psycopg.AsyncConnection[tuple[object, ...]]) -> None:
+            repo = CheckpointRepo(conn)
+            async with conn.cursor() as cur:
+                for shard_id, seq_str in to_flush:
+                    await repo.upsert_in_cursor(
+                        cur,
+                        stream_name=self._stream_name,
+                        shard_id=shard_id,
+                        sequence_number=seq_str,
+                        last_applied_ts_ns=self._last_applied_source_ts_ns,
+                    )
+
+        await self._state_call(body)
+        for shard_id, seq_str in to_flush:
+            self._shard_last_flushed[shard_id] = seq_str
+            self.checkpoints_flushed += 1
 
     # ---- leases + checkpoints -------------------------------------------
 
@@ -887,8 +623,6 @@ class ConsumerPipeline:
             raise
 
     async def _resolve_iterator(self, kinesis: Any, shard_id: str) -> tuple[str | None, str, str | None]:
-        """Return (iterator, iterator_type, starting_sequence_or_None)."""
-
         async def body(conn: psycopg.AsyncConnection[tuple[object, ...]]) -> Any:
             return await CheckpointRepo(conn).get(self._stream_name, shard_id)
 
@@ -909,7 +643,6 @@ class ConsumerPipeline:
                     sequence=cp.sequence_number,
                     error=str(exc),
                 )
-                # Fall through to LATEST / TRIM_HORIZON below.
         iterator_type = "TRIM_HORIZON" if self._start_from_horizon else "LATEST"
         it_resp = await kinesis.get_shard_iterator(
             StreamName=self._stream_name,
@@ -918,15 +651,9 @@ class ConsumerPipeline:
         )
         return it_resp["ShardIterator"], iterator_type, None
 
-    # Removed: `_flush_checkpoint` (timer-based). Checkpoint advancement is now
-    # atomic with apply via `_make_checkpoint_hook`. See review doc issue #1.
-
     # ---- state-connection lifecycle ------------------------------------
 
     async def _state_call(self, func: Any) -> Any:
-        """Run ``await func(conn)`` under the state lock, reconnecting + retrying once
-        on a closed/broken connection. Fixes the "connection closed" wedge where a
-        token-expired state connection would spin forever (M6.4 post-500TPS finding)."""
         async with self._state_lock:
             for attempt in range(2):
                 try:
@@ -947,7 +674,6 @@ class ConsumerPipeline:
         return self._state_conn
 
     async def _refresh_state_conn(self) -> None:
-        """Close any existing state conn and open a fresh one with a refreshed token."""
         old = self._state_conn
         self._state_conn = None
         if old is not None and not old.closed:
@@ -960,11 +686,6 @@ class ConsumerPipeline:
     # ---- metrics loop ---------------------------------------------------
 
     async def _metrics_loop(self) -> None:
-        """Every `METRICS_INTERVAL_MS`, snapshot counters/gauges and emit to CloudWatch.
-
-        Counters are emitted as deltas since last tick so dashboard `Sum` statistic shows
-        rate-per-window naturally. Gauges emit current values (CloudWatch `Average` works).
-        """
         log.info("metrics_loop.start", interval_s=self._metrics_interval_s)
         while not self._stop.is_set():
             with contextlib.suppress(TimeoutError):
@@ -982,24 +703,17 @@ class ConsumerPipeline:
         stream_dim: tuple[tuple[str, str], ...] = (("Stream", self._stream_name),)
         points: list[MetricPoint] = []
 
-        # Counter deltas since last tick.
         counter_names = (
             "records_received",
-            "transactions_committed",
-            "rows_replicated",
-            "rows_deduped",
-            "rows_late_discarded",
+            "rows_applied",
+            "rows_discarded",
             "parse_errors",
             "crc_mismatches",
             "fragment_timeouts",
-            "apply_errors",
-            "fences_opened",
-            "fences_closed_observed",
+            "apply_batches",
             "leases_acquired",
             "leases_lost",
             "checkpoints_flushed",
-            "txn_timeouts",
-            "ingest_rejects_recorded",
         )
         for name in counter_names:
             cur_val = int(getattr(self, name))
@@ -1008,43 +722,15 @@ class ConsumerPipeline:
             self._prev_counters[name] = cur_val
             points.append(MetricPoint(_camel(name), float(delta), "Count", stream_dim))
 
-        # Gauges from ordering buffer.
-        #
-        # `WatermarkLagMs` is a load-bearing historical metric name. Semantics
-        # (see DESIGN.md "Known limits" and `OrderingBuffer` docstring): this
-        # is NOT an end-to-end source-to-replica lag. It is the wall-time age
-        # of the newest `source.ts_ns` we have decided to release past. A
-        # source commit with an older `ts_ns` can still arrive after this
-        # value advances; the per-key LWW stamp absorbs that. Alarm on it as
-        # a staleness proxy, not as a lag SLA.
-        stats = self._ordering.stats()
-        now_ns = time.time_ns()
-        points.append(MetricPoint("OrderingBufferDepth", float(stats.depth), "Count", stream_dim))
-        if stats.watermark_ns is not None:
-            lag_ms = max(0.0, (now_ns - stats.watermark_ns) / 1e6)
-            points.append(MetricPoint("WatermarkLagMs", lag_ms, "Milliseconds", stream_dim))
-            points.append(MetricPoint("WatermarkTsNs", float(stats.watermark_ns), "None", stream_dim))
-        if stats.head_ts_ns is not None:
-            head_age_ms = max(0.0, (now_ns - stats.head_ts_ns) / 1e6)
-            points.append(MetricPoint("OrderingBufferHeadAgeMs", head_age_ms, "Milliseconds", stream_dim))
+        # Replication lag gauge (same semantics as the autoscaler signal).
+        lag = self._current_lag_ms()
+        if lag is not None:
+            points.append(MetricPoint("ReplicationLagMs", lag, "Milliseconds", stream_dim))
+
         points.append(
-            MetricPoint(
-                "IdleShardSyntheticAdvances",
-                float(stats.idle_shards_synthetically_advanced),
-                "Count",
-                stream_dim,
-            )
-        )
-        points.append(
-            MetricPoint(
-                "FenceActive",
-                1.0 if stats.fence_ts_ns is not None else 0.0,
-                "None",
-                stream_dim,
-            )
+            MetricPoint("ApplyQueueDepth", float(self._apply_queue.qsize()), "Count", stream_dim)
         )
 
-        # Per-shard gauges.
         for shard_id, state in self._shard_state.items():
             shard_dim = (*stream_dim, ("Shard", shard_id))
             points.append(
@@ -1056,36 +742,16 @@ class ConsumerPipeline:
                 )
             )
 
-        # Open fence age (one query per emit; low cost).
-        try:
-            fence_row = await self._dlq.fetch_open_fence()
-            if fence_row is not None:
-                age_sec = max(
-                    0.0,
-                    (datetime.now(fence_row.opened_at.tzinfo) - fence_row.opened_at).total_seconds(),
-                )
-                points.append(MetricPoint("OpenFenceCount", 1.0, "Count", stream_dim))
-                points.append(MetricPoint("OpenFenceAgeSec", age_sec, "Seconds", stream_dim))
-            else:
-                points.append(MetricPoint("OpenFenceCount", 0.0, "Count", stream_dim))
-                points.append(MetricPoint("OpenFenceAgeSec", 0.0, "Seconds", stream_dim))
-        except Exception as exc:
-            log.debug("metrics.fence_probe.error", error=str(exc))
-
         await self._metrics.put_batch(points)
 
-    # ---- reassembly sweeper (fragment + transaction) --------------------
+    # ---- fragment-reassembly sweeper ------------------------------------
 
     async def _reassembly_sweeper(self) -> None:
-        """Global sweep of the shared FragmentReassembler and TransactionReassembler.
+        """Global sweep of the shared FragmentReassembler.
 
-        Both reassemblers are process-global because DSQL CDC distributes a single
-        source transaction's records (and a single chunked record's fragments) across
-        every open shard. A per-shard sweep would drop cross-shard chunks/txns
-        prematurely. This single-process task is the only place `fragment.timeout` and
-        `txn.timeout` are observed, and increments `self.txn_timeouts` for the
-        `TxnTimeouts` CloudWatch metric so this failure mode is never silent.
-        """
+        Chunked records' fragments can arrive on different shards, so this
+        sweep must be process-global — a per-shard sweep would drop
+        cross-shard fragment buffers prematurely."""
         log.info("reassembly_sweeper.start", interval_s=self._reassembly_sweep_interval_s)
         while not self._stop.is_set():
             try:
@@ -1098,39 +764,6 @@ class ConsumerPipeline:
                         record_id=ft.record_id,
                         reason=ft.reason,
                     )
-                    # Retire every seq associated with the timed-out chunk +
-                    # its main (if we have the main's identity). Otherwise the
-                    # safe-checkpoint computation would gate forever on them.
-                    if ft.chunk_id:
-                        self._seq_tracker.retire_by_chunk(ft.chunk_id)
-                    if ft.tx_id and ft.record_id:
-                        self._seq_tracker.retire_by_tx_record(ft.tx_id, ft.record_id)
-                    await self._record_ingest_reject(
-                        reason="fragment_timeout",
-                        tx_id=ft.tx_id,
-                        record_id=ft.record_id,
-                        chunk_id=ft.chunk_id or None,
-                        details={"sweep_reason": ft.reason},
-                    )
-                for tt in self._txn.sweep():
-                    self.txn_timeouts += 1
-                    log.warning(
-                        "txn.timeout",
-                        tx_id=tt.tx_id,
-                        buffered=tt.buffered,
-                        expected=tt.expected,
-                    )
-                    # Retire every seq associated with the timed-out txn.
-                    self._seq_tracker.retire_by_tx(tt.tx_id)
-                    await self._record_ingest_reject(
-                        reason="txn_timeout",
-                        tx_id=tt.tx_id,
-                        details={
-                            "buffered": tt.buffered,
-                            "expected": tt.expected,
-                            "sweep_reason": tt.reason,
-                        },
-                    )
             except Exception as exc:
                 log.warning("reassembly_sweeper.error", error=str(exc))
             try:
@@ -1138,37 +771,6 @@ class ConsumerPipeline:
             except TimeoutError:
                 continue
         log.info("reassembly_sweeper.stop")
-
-    # ---- fence poller ---------------------------------------------------
-
-    async def _fence_poller(self) -> None:
-        """Watch target DSQL for fence-close signals from the ops CLI.
-
-        When no OPEN fence row remains, clear the in-memory fence so the ordering buffer
-        resumes draining in `ts_ns` order. New apply failures restart this loop by
-        reopening a fence row.
-        """
-        log.info("fence_poller.start", interval_s=self._fence_poll_interval_s)
-        while not self._stop.is_set():
-            try:
-                row = await self._dlq.fetch_open_fence()
-                in_memory = self._ordering.fence_ts_ns
-                if row is None and in_memory is not None:
-                    self._ordering.set_fence(None)
-                    self.fences_closed_observed += 1
-                    log.info("fence_poller.cleared", prev_fence_ts_ns=in_memory)
-                elif row is not None and in_memory != row.fence_ts_ns:
-                    # Operator or another worker opened a fence we didn't see yet;
-                    # mirror it so we don't release past it.
-                    self._ordering.set_fence(row.fence_ts_ns)
-                    log.info("fence_poller.synced", fence_ts_ns=row.fence_ts_ns, tx_id=row.tx_id)
-            except Exception as exc:
-                log.warning("fence_poller.error", error=str(exc))
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=self._fence_poll_interval_s)
-            except TimeoutError:
-                continue
-        log.info("fence_poller.stop")
 
     # ---- signals --------------------------------------------------------
 
@@ -1179,102 +781,33 @@ class ConsumerPipeline:
                 loop.add_signal_handler(sig, self.stop)
 
 
-def _ts_ns_of_ready(ready: Any) -> int:
-    """Pull `source.ts_ns` from a FullRecord or AssembledRecord."""
-    main = getattr(ready, "main", None)
-    source = getattr(main or ready, "source", None)
+# ---------- helpers ----------
+
+
+def _ts_ns_of(rec: ReadyRecord) -> int:
+    main = getattr(rec, "main", None)
+    source = getattr(main or rec, "source", None)
     return int(getattr(source, "ts_ns", 0)) if source is not None else 0
 
 
-def _tx_id_of(env: Any) -> str | None:
-    """Best-effort `source.tx_id` extraction for ingest-reject bookkeeping."""
-    source = getattr(env, "source", None)
-    tx_id = getattr(source, "tx_id", None)
-    return str(tx_id) if tx_id is not None else None
+def _seq_sort_key(seq: str) -> int:
+    """Kinesis sequence numbers are decimal strings; compare numerically.
 
-
-def _record_id_of(env: Any) -> str | None:
-    """Best-effort `transaction.record_id` extraction for ingest-reject bookkeeping."""
-    transaction = getattr(env, "transaction", None)
-    record_id = getattr(transaction, "record_id", None)
-    return str(record_id) if record_id is not None else None
-
-
-def _chunk_id_of(env: Any) -> str | None:
-    """Best-effort chunk_id extraction. For a FragmentRecord it's `env.chunk_id`;
-    for a ChunkedRecord it's one of `chunked.before.chunk_id` / `chunked.after.chunk_id`."""
-    ids = _chunk_ids_of(env)
-    return ids[0] if ids else None
-
-
-def _chunk_ids_of(env: Any) -> list[str]:
-    """Return every chunk_id referenced by this envelope.
-
-    - FragmentRecord → `[env.chunk_id]`.
-    - ChunkedRecord → the referenced `chunked.before.chunk_id` and/or
-      `chunked.after.chunk_id` (0, 1, or 2 entries).
-    - FullRecord → `[]`.
-    """
-    out: list[str] = []
-    direct = getattr(env, "chunk_id", None)
-    if direct is not None:
-        out.append(str(direct))
-    chunked = getattr(env, "chunked", None)
-    if chunked is not None:
-        for side in ("before", "after"):
-            descriptor = getattr(chunked, side, None)
-            if descriptor is not None:
-                cid = getattr(descriptor, "chunk_id", None)
-                if cid is not None:
-                    out.append(str(cid))
-    return out
-
-
-def _completed_txn_chunk_ids(txn: Any) -> list[str]:
-    """Every chunk_id referenced by any record in a `CompletedTransaction`."""
-    out: list[str] = []
-    for rec in getattr(txn, "records", ()):
-        main = getattr(rec, "main", None)
-        if main is None:
-            # FullRecord — no chunks.
-            continue
-        chunked = getattr(main, "chunked", None)
-        if chunked is None:
-            continue
-        for side in ("before", "after"):
-            descriptor = getattr(chunked, side, None)
-            if descriptor is not None:
-                cid = getattr(descriptor, "chunk_id", None)
-                if cid is not None:
-                    out.append(str(cid))
-    return out
-
-
-def _completed_txn_tx_record_ids(txn: Any) -> list[tuple[str, str]]:
-    """Every `(tx_id, record_id)` present in a `CompletedTransaction`."""
-    out: list[tuple[str, str]] = []
-    for rec in getattr(txn, "records", ()):
-        main = getattr(rec, "main", None) or rec
-        source = getattr(main, "source", None)
-        transaction = getattr(main, "transaction", None)
-        if source is None or transaction is None:
-            continue
-        tx = getattr(source, "tx_id", None)
-        rid = getattr(transaction, "record_id", None)
-        if tx and rid:
-            out.append((str(tx), str(rid)))
-    return out
+    A fallback hash keeps best-effort ordering for non-numeric test sequences
+    without raising."""
+    if not seq:
+        return -1
+    try:
+        return int(seq)
+    except (TypeError, ValueError):
+        return hash(seq)
 
 
 def _camel(snake: str) -> str:
-    """`records_received` → `RecordsReceived` for CloudWatch metric names."""
     return "".join(part.capitalize() for part in snake.split("_"))
 
 
 def _liveness_path() -> str:
-    """Per-process liveness file when running under the multi-process supervisor
-    (`PROCESS_ID` is set in each child), otherwise the single-process path.
-    `health._probe_liveness` reads `REPLICATOR_PROCESSES` and checks each file."""
     import os as _os
 
     pid = _os.environ.get("PROCESS_ID")
@@ -1284,10 +817,6 @@ def _liveness_path() -> str:
 
 
 def _touch_liveness() -> None:
-    """Update the liveness-heartbeat file mtime. Called from the metrics loop.
-
-    The container HEALTHCHECK (`dsql-replicator healthz`) reads this file's age — a
-    stale file means the pipeline is wedged even if all AWS probes still pass."""
     from pathlib import Path
 
     with contextlib.suppress(OSError):

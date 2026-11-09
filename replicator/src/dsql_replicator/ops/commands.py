@@ -178,14 +178,17 @@ async def _cmd_retry(tx_id: str, *, edited_payload: dict[str, Any] | None) -> No
                 if updated == 0:
                     raise ApplyError(f"no OPEN fence for tx_id={tx_id}; retry aborted")
 
-            result = await applier.apply(txn, pre_commit_hook=_close)
+            # Post-simplification: the applier is per-record LWW. Re-apply the
+            # stored transaction's records as a single batch — row-level LWW
+            # makes replay idempotent against stamps that have already moved
+            # past this ts_ns.
+            result = await applier.apply_batch(list(txn.records), pre_commit_hook=_close)
             await writer.publish_closed(tx_id)
-            # Persist the edited payload for forensic traceability.
             if edited_payload is not None:
                 await _overwrite_payload(writer, tx_id, edited_payload)
             click.echo(
                 f"retry.ok tx_id={tx_id} rows_applied={result.rows_applied} "
-                f"dedup={result.rows_deduped} attempt={result.attempt}"
+                f"discarded={result.rows_discarded} attempt={result.attempt}"
             )
         finally:
             await applier.close()

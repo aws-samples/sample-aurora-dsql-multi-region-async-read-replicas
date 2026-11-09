@@ -1,30 +1,18 @@
-"""Target-DSQL schema for the replicator state plane (M4+).
+"""Target-DSQL schema for the replicator state plane.
 
-Three tables, idempotent `CREATE TABLE IF NOT EXISTS`. Each statement runs in its own
+Two tables, idempotent `CREATE TABLE IF NOT EXISTS`. Each statement runs in its own
 transaction because DSQL only allows one DDL per transaction
 (`FeatureNotSupported: multiple ddl statements not supported in a transaction`).
 
-Design notes:
-
 - `__replicator_checkpoints`: `(stream_name, shard_id)` PK. `sequence_number` is the
-  last Kinesis sequence that we've either applied-or-DLQ'd for this shard. Checkpoint
-  advancement must be atomic with the row apply + stamp — do the UPDATE inside the
-  same transaction as the row inserts (same pattern as the DLQ fence close).
+  latest Kinesis sequence we have consumed for the shard. Advancement is in-band with
+  apply when a shard contributed to the batch, plus a periodic best-effort flush for
+  shards that are quiet (e.g., records parked in fragment reassembly). Row-level LWW
+  makes re-apply idempotent on restart.
 
-- `__replicator_shard_leases`: single-writer lease per (stream, shard). Steal pattern:
-    `UPDATE … SET task_id = :self, lease_token = :new_uuid, expires_at = now() + :ttl
-     WHERE (stream_name, shard_id) = (:s, :sh)
-       AND (task_id = :self OR expires_at < now())
-     RETURNING lease_token;`
-  If `rowcount == 0`, someone else owns the lease. Heartbeat pattern uses the cached
-  `lease_token` as a fencing token so a stale task can't accidentally refresh after
-  losing the lease.
-
-- `__replicator_watermark_state`: persisted mirror of per-shard watermarks. On cold
-  start a worker reads this to seed its in-memory watermark; the ordering buffer gate
-  then uses the live `min(effective_ts_ns)` across all registered shards. Not required
-  for correctness — in-memory watermark converges within one poll — but shortens the
-  warm-up window where no commits advance.
+- `__replicator_shard_leases`: single-writer lease per (stream, shard). Steal pattern
+  uses a conditional UPDATE; heartbeat uses the cached `lease_token` as a fencing
+  token so a stale task can't accidentally refresh after losing the lease.
 """
 
 from __future__ import annotations
@@ -58,25 +46,13 @@ CREATE TABLE IF NOT EXISTS __replicator_shard_leases (
 )
 """
 
-WATERMARK_STATE_DDL = """
-CREATE TABLE IF NOT EXISTS __replicator_watermark_state (
-    stream_name          text        NOT NULL,
-    shard_id             text        NOT NULL,
-    latest_ts_ns         bigint      NOT NULL,
-    millis_behind_latest integer     NOT NULL,
-    updated_at           timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (stream_name, shard_id)
-)
-"""
-
-
 async def bootstrap_state_tables(conn: psycopg.AsyncConnection[tuple[object, ...]]) -> None:
-    """Create checkpoints + shard-leases + watermark-state tables. Idempotent.
+    """Create checkpoints + shard-leases tables. Idempotent.
 
     Each CREATE runs in its own commit (DSQL rejects multiple DDL per txn).
     Safe to call on every process start.
     """
-    for ddl in (CHECKPOINTS_DDL, SHARD_LEASES_DDL, WATERMARK_STATE_DDL):
+    for ddl in (CHECKPOINTS_DDL, SHARD_LEASES_DDL):
         async with conn.cursor() as cur:
             await cur.execute(ddl)
         await conn.commit()

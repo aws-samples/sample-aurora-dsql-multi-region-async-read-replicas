@@ -166,36 +166,20 @@ def _build_dashboard(cfg: Config) -> dict[str, Any]:
         }
 
     widgets: list[dict[str, Any]] = [
-        # Row 1 — single-value snapshot: fence state + backlog + lag
+        # Row 1 — single-value snapshot: queue depth + replication lag
         _sv(
-            "Open fence age (s)",
-            [_search("OpenFenceAgeSec", agg="MAX", label="Age (max across processes)")],
+            "Apply queue depth",
+            [_search("ApplyQueueDepth", agg="SUM", label="Depth (sum across processes)")],
             0,
             0,
             6,
             4,
         ),
         _sv(
-            "Open fence count",
-            [_search("OpenFenceCount", agg="SUM", label="Fences (sum)")],
+            "Replication lag (ms)",
+            [_search("ReplicationLagMs", agg="MAX", label="Lag (max across processes)")],
             0,
             6,
-            6,
-            4,
-        ),
-        _sv(
-            "Ordering buffer depth",
-            [_search("OrderingBufferDepth", agg="SUM", label="Buffered txns (sum)")],
-            0,
-            12,
-            6,
-            4,
-        ),
-        _sv(
-            "Watermark lag (ms)",
-            [_search("WatermarkLagMs", agg="MAX", label="Lag (max across processes)")],
-            0,
-            18,
             6,
             4,
         ),
@@ -204,46 +188,35 @@ def _build_dashboard(cfg: Config) -> dict[str, Any]:
             "Throughput (per-min, summed across processes)",
             [
                 _search("RecordsReceived", agg="SUM", label="RecordsReceived"),
-                _search("TransactionsCommitted", agg="SUM", label="TransactionsCommitted"),
-                _search("RowsReplicated", agg="SUM", label="RowsReplicated"),
-                _search("RowsDeduped", agg="SUM", label="RowsDeduped"),
-                _search("RowsLateDiscarded", agg="SUM", label="RowsLateDiscarded"),
+                _search("ApplyBatches", agg="SUM", label="ApplyBatches"),
+                _search("RowsApplied", agg="SUM", label="RowsApplied"),
+                _search("RowsDiscarded", agg="SUM", label="RowsDiscarded"),
             ],
             4,
             0,
             24,
             6,
         ),
-        # Row 3 — errors + fence lifecycle. Includes the per-reason ingest-reject
-        # counters landed in review fix #2 so a reviewer can tell a parse_error
-        # drop from a crc_mismatch drop from a fragment_timeout drop from a
-        # txn_timeout drop — rather than one lumped "parse_errors" bucket that
-        # used to swallow CRC mismatches too.
+        # Row 3 — per-reason ingest errors so an operator can tell a parse_error
+        # drop from a crc_mismatch drop from a fragment_timeout drop.
         _ts(
-            "Errors & fence lifecycle",
+            "Ingest errors",
             [
-                _search("ApplyErrors", agg="SUM", label="ApplyErrors"),
                 _search("ParseErrors", agg="SUM", label="ParseErrors"),
                 _search("CrcMismatches", agg="SUM", label="CrcMismatches"),
                 _search("FragmentTimeouts", agg="SUM", label="FragmentTimeouts"),
-                _search("TxnTimeouts", agg="SUM", label="TxnTimeouts"),
-                _search("IngestRejectsRecorded", agg="SUM", label="IngestRejectsRecorded"),
-                _search("FencesOpened", agg="SUM", label="FencesOpened"),
-                _search("FencesClosedObserved", agg="SUM", label="FencesClosedObserved"),
             ],
             10,
             0,
             24,
             6,
         ),
-        # Row 4 — lag + backlog over time
+        # Row 4 — replication lag over time
         _ts(
-            "Watermark + backlog",
+            "Replication lag + queue depth",
             [
-                _search("WatermarkLagMs", agg="MAX", label="WatermarkLagMs (max)"),
-                _search("OrderingBufferDepth", agg="SUM", label="OrderingBufferDepth (sum)"),
-                _search("OrderingBufferHeadAgeMs", agg="MAX", label="HeadAge (max)"),
-                _search("IdleShardSyntheticAdvances", agg="SUM", label="IdleSynth (sum)"),
+                _search("ReplicationLagMs", agg="MAX", label="ReplicationLagMs (max)"),
+                _search("ApplyQueueDepth", agg="SUM", label="ApplyQueueDepth (sum)"),
             ],
             16,
             0,
@@ -257,7 +230,6 @@ def _build_dashboard(cfg: Config) -> dict[str, Any]:
                 _search("LeasesAcquired", agg="SUM", label="LeasesAcquired"),
                 _search("LeasesLost", agg="SUM", label="LeasesLost"),
                 _search("CheckpointsFlushed", agg="SUM", label="CheckpointsFlushed"),
-                _search("FenceActive", agg="MAX", label="FenceActive (max)"),
             ],
             22,
             0,

@@ -1,15 +1,14 @@
-"""Replicator state plane — target-DSQL tables for checkpoints, shard leases, watermarks.
+"""Replicator state plane — target-DSQL tables for checkpoints + shard leases.
 
-Scope (M4+):
-- `__replicator_checkpoints` — iterator position + last applied ts per (stream, shard).
-- `__replicator_shard_leases` — single-writer lease per (stream, shard) with heartbeats
-  and expiry. Replaces the DDB-based model from the original spec.
-- `__replicator_watermark_state` — persisted mirror of per-shard watermarks for cold
-  restart (so a new task doesn't start from `latest_ts_ns=0` while others have
-  already advanced).
+Scope (post-2026-11 simplification pass):
+- `__replicator_checkpoints` — iterator position per (stream, shard).
+- `__replicator_shard_leases` — single-writer lease per (stream, shard) with
+  heartbeats and expiry.
 
-All three live in the target DSQL cluster, parallel to the 2026-10-09 idempotency
-decision and the 2026-10-12 DLQ-in-DSQL decision.
+The old `__replicator_watermark_state` table and the in-process
+`ShardSeqTracker` were dropped alongside the ordering buffer; checkpoints
+are now best-effort per-shard flushes and row-level LWW makes re-apply
+idempotent on restart.
 """
 
 from __future__ import annotations
@@ -19,19 +18,15 @@ from .lease import LeaseRepo, LeaseRow
 from .schema import (
     CHECKPOINTS_DDL,
     SHARD_LEASES_DDL,
-    WATERMARK_STATE_DDL,
     bootstrap_state_tables,
 )
-from .seq_tracker import ShardSeqTracker
 
 __all__ = [
     "CHECKPOINTS_DDL",
     "SHARD_LEASES_DDL",
-    "WATERMARK_STATE_DDL",
     "CheckpointRepo",
     "CheckpointRow",
     "LeaseRepo",
     "LeaseRow",
-    "ShardSeqTracker",
     "bootstrap_state_tables",
 ]

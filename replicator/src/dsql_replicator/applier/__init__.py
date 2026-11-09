@@ -1,13 +1,11 @@
-"""Applier: serial commit lane that writes CompletedTransactions to the target DSQL cluster."""
+"""Applier: per-row LWW upsert into the target DSQL cluster."""
 
 from __future__ import annotations
 
-from .apply import Applier, ApplyError, ApplyResult, InjectedFaultError, RetryableApplyError
+from .apply import Applier, ApplyError, ApplyResult
 
 __all__ = [
     "Applier",
     "ApplyError",
     "ApplyResult",
-    "InjectedFaultError",
-    "RetryableApplyError",
 ]

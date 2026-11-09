@@ -1,27 +1,31 @@
-"""Applier: write `CompletedTransaction`s to the target DSQL cluster atomically.
+"""Applier: per-row last-writer-wins upsert into the target DSQL cluster.
 
-Design (M6.0 — per-key parallel apply, reversing the 2026-10-08 serial-lane decision):
+Row-level eventual consistency (post-2026-11 simplification pass). For each
+record we write the row and bump `__replicator_lww_stamps` for its primary key,
+gated by:
 
-- **Stripe locks.** The applier owns `stripe_count` asyncio.Locks (default 64). Each
-  touched key `(schema, table, pk-tuple)` is hashed into a stripe id. To commit a txn,
-  the worker acquires the sorted set of touched stripes (in sorted order to avoid
-  deadlock), executes `BEGIN..COMMIT`, releases.
+    INSERT INTO __replicator_lww_stamps VALUES (schema, table, pk, ts_ns)
+    ON CONFLICT (schema, table, pk) DO UPDATE
+       SET applied_ts_ns = EXCLUDED.applied_ts_ns, applied_at = now()
+     WHERE __replicator_lww_stamps.applied_ts_ns < EXCLUDED.applied_ts_ns
 
-- **Connection pool.** `worker_count` dedicated psycopg3 connections (default 32) are
-  held in an asyncio.Queue. Workers get a connection for the duration of one apply and
-  return it. A separate schema connection services the SchemaCache for stripe
-  computation.
+If the stamp advances we run the row DML in the same transaction; otherwise
+the record is silently discarded. Rows converge to the latest source commit
+per primary key. **Transactions do NOT converge** — two source commits
+touching different rows can land on the replica in any order, so the replica
+may briefly show a state that never existed at the source. See
+docs/DESIGN.md for the full contract.
 
-- **Atomic row + stamp.** Each apply still writes the row(s) and the
-  `__replicator_applied(tx_id, record_id)` stamp in ONE DSQL transaction.
+Retries are **infinite** with exponential backoff capped at `backoff_cap_s`.
+A persistent apply failure blocks only its own stripe locks, letting other
+keys keep flowing.
 
-- **UPSERT / DELETE SQL.** Unchanged from M1.
-
-- **Retries.** Transient failures retry up to `APPLY_MAX_RETRIES` with exponential
-  backoff + full jitter. Non-retryable failures raise `ApplyError` (caller opens fence).
-
-Setting `stripe_count=1` + `worker_count=1` is backward-compatible with the serial
-Applier (acts as one lock, one connection).
+- Stripe locks (default 64) serialize per-key apply so concurrent workers
+  don't thrash with OCC conflicts on the same primary key.
+- Connection pool of `worker_count` dedicated psycopg3 connections, grown /
+  shrunk at runtime by the writer autoscaler.
+- The stamp table is kept **separate from customer tables** — stamps are
+  never inlined into customer rows, so the solution is non-invasive.
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hashlib
+import json
 import random
 import time
 from collections.abc import Awaitable, Callable
@@ -41,10 +46,9 @@ import structlog
 from psycopg import errors as pg_errors
 from psycopg import sql
 
-from dsql_replicator.dlq.schema import bootstrap_dlq_tables
 from dsql_replicator.envelope import ChunkedRecord, FullRecord
 from dsql_replicator.errors import ReplicatorError
-from dsql_replicator.reassembler import AssembledRecord, CompletedTransaction, ReadyRecord
+from dsql_replicator.reassembler import AssembledRecord, ReadyRecord
 from dsql_replicator.state.schema import bootstrap_state_tables
 
 from .coerce import coerce_value
@@ -55,8 +59,8 @@ CursorHook = Callable[[psycopg.AsyncCursor[Any]], Awaitable[None]]
 
 log = structlog.get_logger("applier")
 
-_APPLIED_TABLE_DDL = """
-CREATE TABLE IF NOT EXISTS __replicator_applied_v2 (
+_STAMPS_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS __replicator_lww_stamps (
     schema_name   text NOT NULL,
     table_name    text NOT NULL,
     pk            text NOT NULL,
@@ -65,82 +69,24 @@ CREATE TABLE IF NOT EXISTS __replicator_applied_v2 (
     PRIMARY KEY (schema_name, table_name, pk)
 )
 """
-# Per-key last-writer-wins bookkeeping. DSQL CDC is at-least-once and the
-# ordering-buffer release gate is NOT a source-side quiescence attestation
-# (see DESIGN.md "Known limits"), so a duplicate redelivery can arrive after
-# we've already applied a different txn on the same key, and an older-ts_ns
-# commit can still arrive after a newer one was applied. Keeping the latest
-# applied `source.ts_ns` per key, and only applying a row when its `ts_ns`
-# strictly exceeds the stored one, gives us **eventual per-key convergence**.
-#
-# This is NOT transaction-level SQL consistency. If source txn T1 touched rows
-# (A, B) and T2 touched B before T1.A arrived, the replica holds (A@T1, B@T2) —
-# a state that never existed at the source. Cross-row invariants held by T1
-# can be violated on the replica until T1 is fully applied or until a later
-# txn rewrites both keys. Rows that lose the LWW race are archived to
-# `__replicator_late_discards` and surfaced on the `RowsLateDiscarded`
-# CloudWatch metric for operator alarm.
-#
-# Replaces the earlier `(tx_id, record_id)` dedup, which blocked duplicate
-# redelivery from fixing a prior out-of-order apply.
-
-_LATE_DISCARDS_TABLE_DDL = """
-CREATE TABLE IF NOT EXISTS __replicator_late_discards (
-    tx_id          text        NOT NULL,
-    record_id      text        NOT NULL,
-    schema_name    text        NOT NULL,
-    table_name     text        NOT NULL,
-    pk             text        NOT NULL,
-    incoming_ts_ns bigint      NOT NULL,
-    stored_ts_ns   bigint      NOT NULL,
-    op             text        NOT NULL,
-    payload        text,
-    discarded_at   timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (tx_id, record_id)
-)
-"""
-# Audit log for rows that lost the per-key LWW race. A late-arriving older
-# source txn on a key already applied with a higher `ts_ns` is correctly
-# rejected by `__replicator_applied_v2`'s gated UPSERT — this table captures
-# the full record payload so an operator can inspect what the "losing" write
-# would have done, without conflating it with real apply failures (which
-# still go to `__replicator_dlq_fences` + `__replicator_dlq_payload`).
-# Written in the same target transaction as the stamp lookup, so persistence
-# is atomic with the LWW decision.
 
 
 class ApplyError(ReplicatorError):
-    """Permanent failure applying a transaction to the target. Caller should DLQ + fence."""
+    """Non-retryable apply failure (schema missing on target, malformed record).
 
-
-class RetryableApplyError(ReplicatorError):
-    """Transient failure; the Applier retries internally and only raises `ApplyError` after
-    `APPLY_MAX_RETRIES` is exhausted. Exposed for test introspection."""
-
-
-class InjectedFaultError(RuntimeError):
-    """Raised by the Applier's test-only fault hook. Simulates a crash mid-apply before
-    COMMIT, forcing the `conn.transaction()` context manager to issue a ROLLBACK.
-    See `Applier(_fault_after_rows=N)`."""
+    Transient infrastructure failures do NOT raise this — they retry forever
+    with exponential backoff inside `apply_batch`."""
 
 
 @dataclass(frozen=True)
 class ApplyResult:
-    tx_id: str
     rows_applied: int
-    rows_deduped: int
+    rows_discarded: int  # LWW-rejected or crash-replay dedup
     attempt: int
     duration_ms: float
     stripes: tuple[int, ...] = ()
-    # Rows the LWW stamp rejected because an older `t_commit` arrived after a
-    # newer one had already been applied for the same key. These are stored
-    # in `__replicator_late_discards` for audit and counted on a dedicated
-    # `RowsLateDiscarded` metric — distinct from crash-replay dedup and from
-    # genuine apply failures (which still go to the DLQ fence).
-    rows_late_discarded: int = 0
 
 
-# Transient classes that warrant a retry.
 _RETRYABLE: tuple[type[BaseException], ...] = (
     psycopg.OperationalError,
     psycopg.InterfaceError,
@@ -158,68 +104,47 @@ class Applier:
         self,
         endpoint: DsqlEndpoint,
         *,
-        max_retries: int = 5,
         backoff_initial_s: float = 0.1,
         backoff_cap_s: float = 10.0,
         stripe_count: int = 64,
         worker_count: int = 32,
         max_worker_count: int | None = None,
-        _fault_after_rows: int | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._token_cache = DsqlTokenCache(endpoint)
-        self._max_retries = max_retries
         self._backoff_initial = backoff_initial_s
         self._backoff_cap = backoff_cap_s
         self._stripe_count = max(1, stripe_count)
         self._worker_count = max(1, worker_count)
-        # Autoscale ceiling. The connection pool is sized to this at startup
-        # so grow_pool() can .put() new connections without rebuilding the
-        # queue; stripes must be sized to the ceiling too (see DESIGN.md
-        # STRIPES >= 64 x WORKERS). Defaults to the current count so
-        # callers that don't opt into scaling see identical behavior.
         self._max_worker_count = max(self._worker_count, max_worker_count or self._worker_count)
         self._stripes: list[asyncio.Lock] = [asyncio.Lock() for _ in range(self._stripe_count)]
         self._conn_pool: asyncio.Queue[psycopg.AsyncConnection[tuple[object, ...]]] = asyncio.Queue(
             maxsize=self._max_worker_count
         )
-        # Serializes grow_pool / shrink_pool so the autoscaler can call them
-        # concurrently with apply traffic without racing on _worker_count.
         self._pool_resize_lock = asyncio.Lock()
-        # Track each pool connection's open time so we can proactively recycle
-        # before the IAM token (TTL ~15 min) expires server-side. Without this,
-        # the first apply after a 15 min idle period hits dead sockets on every
-        # retry and fences (incident: 2026-10-26 pool-idle SSL-EOF).
+        # DSQL IAM tokens expire after ~15 min. Pre-emptively recycle any pool
+        # connection that is older than this before handing it out, else a
+        # quiet pool returns dead sockets after an idle window.
         self._conn_opened_mono: dict[int, float] = {}
-        self._conn_max_age_s: float = 12 * 60.0  # recycle before 15-min token TTL
+        self._conn_max_age_s: float = 12 * 60.0
         self._schema_conn: psycopg.AsyncConnection[tuple[object, ...]] | None = None
         self._schema: SchemaCache | None = None
         self._bootstrapped = False
-        # Test-only crash hook, see InjectedFaultError.
-        self._fault_after_rows = _fault_after_rows
 
     # ---- lifecycle ------------------------------------------------------
 
     async def start(self) -> None:
-        """Open worker connections + schema connection; bootstrap state tables.
-
-        Pool pre-warm is **staggered** (20 ms between connects) so N worker
-        connections don't hit the DSQL endpoint simultaneously. Without the
-        stagger, the 128-connection cold burst at task start combined with the
-        unlocked token cache produced correlated `SSL EOF` failures and opened
-        fences (incident: 2026-10-26). Total pre-warm time at 128 workers is
-        ~2.5 s + per-connect latency, dwarfed by the first-ever DSQL warmup.
-        """
         if self._schema_conn is not None:
             return
         self._schema_conn = await open_connection(self._endpoint, self._token_cache, autocommit=False)
         self._schema = SchemaCache(self._schema_conn)
         await self._bootstrap_tables()
+        # Staggered pre-warm so a large pool doesn't hit the DSQL endpoint
+        # with correlated token-mint + TLS handshake bursts.
         for i in range(self._worker_count):
             conn = await open_connection(self._endpoint, self._token_cache, autocommit=False)
             self._conn_opened_mono[id(conn)] = time.monotonic()
             await self._conn_pool.put(conn)
-            # Only stagger non-trivial pool sizes; 1-worker test setups skip.
             if self._worker_count > 4 and i < self._worker_count - 1:
                 await asyncio.sleep(0.02)
 
@@ -233,7 +158,18 @@ class Applier:
             await self._schema_conn.close()
         self._schema_conn = None
 
-    # ---- dynamic pool resizing (used by WorkerAutoscaler) ----------------
+    async def _bootstrap_tables(self) -> None:
+        if self._bootstrapped:
+            return
+        assert self._schema_conn is not None
+        # DSQL rejects multiple DDL per transaction; commit after each CREATE.
+        async with self._schema_conn.cursor() as cur:
+            await cur.execute(_STAMPS_TABLE_DDL)
+        await self._schema_conn.commit()
+        await bootstrap_state_tables(self._schema_conn)
+        self._bootstrapped = True
+
+    # ---- dynamic pool resizing (used by WorkerAutoscaler) ---------------
 
     @property
     def worker_count(self) -> int:
@@ -244,9 +180,6 @@ class Applier:
         return self._max_worker_count
 
     async def grow_pool(self, delta: int) -> int:
-        """Add up to `delta` fresh connections to the apply pool. Caps at
-        max_worker_count. Returns the number actually added. Safe to call
-        concurrently with apply traffic."""
         if delta <= 0:
             return 0
         async with self._pool_resize_lock:
@@ -262,13 +195,9 @@ class Applier:
             return to_add
 
     async def shrink_pool(self, delta: int) -> int:
-        """Best-effort shrink: pop up to `delta` connections from the pool
-        and close them. Never blocks: if the pool is drained (all workers
-        busy), returns 0 and the caller should retry next tick."""
         if delta <= 0 or self._worker_count <= 1:
             return 0
         async with self._pool_resize_lock:
-            # Keep at least 1 worker so apply traffic doesn't deadlock.
             floor_room = self._worker_count - 1
             to_remove = min(delta, floor_room, self._conn_pool.qsize())
             removed = 0
@@ -285,18 +214,9 @@ class Applier:
             return removed
 
     async def _borrow_fresh_conn(self) -> psycopg.AsyncConnection[tuple[object, ...]]:
-        """Pop a connection from the pool; if its token is near expiry, recycle it.
-
-        DSQL IAM tokens live ~15 min. A pool connection opened at task start sits
-        with an aging token every time the pool is quiet. Server-side the token
-        expires and the next first-use read EOFs — which produced the 2026-10-26
-        post-idle fence storm. We proactively close and reopen any conn whose
-        open-age exceeds `_conn_max_age_s` (12 min, with a buffer under the TTL).
-        """
         conn = await self._conn_pool.get()
         opened_at = self._conn_opened_mono.pop(id(conn), 0.0)
         if conn.closed or (time.monotonic() - opened_at) >= self._conn_max_age_s:
-            # Replace a stale (or externally-closed) conn before handing it out.
             if not conn.closed:
                 with contextlib.suppress(Exception):
                     await conn.close()
@@ -305,90 +225,44 @@ class Applier:
                 conn = await open_connection(self._endpoint, self._token_cache, autocommit=False)
                 log.debug("conn.recycle", age_s=round(time.monotonic() - opened_at, 1))
             except Exception as exc:
-                # Open failed; retry loop will handle; return a closed sentinel.
                 log.warning("conn.recycle.open_failed", error=str(exc))
-                # Still return the (now closed) conn so the pool invariant holds;
-                # the retry loop treats closed conns as retryable.
         self._conn_opened_mono[id(conn)] = time.monotonic()
         return conn
 
-    async def _bootstrap_tables(self) -> None:
-        if self._bootstrapped:
-            return
-        assert self._schema_conn is not None
-        # DSQL enforces one DDL per transaction; commit after EACH CREATE.
-        async with self._schema_conn.cursor() as cur:
-            await cur.execute(_APPLIED_TABLE_DDL)
-        await self._schema_conn.commit()
-        async with self._schema_conn.cursor() as cur:
-            await cur.execute(_LATE_DISCARDS_TABLE_DDL)
-        await self._schema_conn.commit()
-        await bootstrap_dlq_tables(self._schema_conn)
-        await bootstrap_state_tables(self._schema_conn)
-        self._bootstrapped = True
-
     # ---- apply ----------------------------------------------------------
-
-    async def apply(
-        self,
-        txn: CompletedTransaction,
-        *,
-        pre_commit_hook: CursorHook | None = None,
-    ) -> ApplyResult:
-        """Apply one transaction atomically. Serializes per-key via stripe locks."""
-        if self._schema is None:
-            raise ApplyError("Applier.start() must be called before apply()")
-
-        touched: set[int] | None = None
-        for attempt in range(2):
-            try:
-                touched = await self._compute_touched_stripes(txn)
-                break
-            except SchemaNotFoundError as exc:
-                raise ApplyError(f"schema missing on target: {exc}") from exc
-            except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
-                if attempt == 0:
-                    log.warning("schema_conn.reconnect", error=str(exc))
-                    await self._refresh_schema_conn()
-                    continue
-                raise ApplyError(f"schema connection failure: {exc}") from exc
-        assert touched is not None
-        sorted_stripes = sorted(touched)
-
-        async with AsyncExitStack() as stack:
-            # Deadlock-free lock acquisition in sorted order.
-            for s in sorted_stripes:
-                await stack.enter_async_context(self._stripes[s])
-            return await self._apply_with_retry(txn, pre_commit_hook, tuple(sorted_stripes))
-        raise ApplyError(f"unreachable: AsyncExitStack escaped for tx_id={txn.tx_id}")
 
     async def apply_batch(
         self,
-        txns: list[CompletedTransaction],
+        records: list[ReadyRecord],
         *,
         pre_commit_hook: CursorHook | None = None,
-    ) -> list[ApplyResult]:
-        """Apply N source transactions in a single target-side BEGIN..COMMIT.
+    ) -> ApplyResult:
+        """Apply a batch of records in one target BEGIN..COMMIT with per-row LWW.
 
-        See prior docstring for correctness contract. Timing instrumentation:
-        every ~1-in-20 batch emits an `apply_batch.stage_timings` log line
-        with ms spent in schema-compute vs. stripe-acquire vs. pool-wait vs.
-        commit — this is the breakdown used to diagnose where the pipeline
-        actually spends its wall-clock time. Added 2026-10-26 after client-
-        side instrumentation showed 20% CPU + idle pool at 88 TPS cap.
+        The batch acquires stripe locks for the union of touched primary keys
+        (in sorted order to avoid deadlock), then runs:
+
+            for rec in records:
+                stamped = INSERT ... ON CONFLICT DO UPDATE ... WHERE older_ts_ns
+                if stamped: apply row DML
+            pre_commit_hook(cursor)
+            COMMIT
+
+        Retries forever on transient DSQL failures with exponential backoff.
+        Only raises `ApplyError` for structural problems (schema missing on
+        target) that are not fixable by retrying.
         """
-        if not txns:
-            return []
+        if not records:
+            return ApplyResult(0, 0, 1, 0.0, ())
         if self._schema is None:
             raise ApplyError("Applier.start() must be called before apply_batch()")
 
-        t_schema0 = time.monotonic()
         touched: set[int] = set()
         for attempt in range(2):
             try:
                 touched = set()
-                for t in txns:
-                    touched |= await self._compute_touched_stripes(t)
+                for rec in records:
+                    touched |= await self._touched_stripes(rec)
                 break
             except SchemaNotFoundError as exc:
                 raise ApplyError(f"schema missing on target: {exc}") from exc
@@ -398,380 +272,134 @@ class Applier:
                     await self._refresh_schema_conn()
                     continue
                 raise ApplyError(f"schema connection failure: {exc}") from exc
-        schema_ms = (time.monotonic() - t_schema0) * 1000.0
-        sorted_stripes = sorted(touched)
+        sorted_stripes = tuple(sorted(touched))
 
-        t_stripe0 = time.monotonic()
         async with AsyncExitStack() as stack:
             for s in sorted_stripes:
                 await stack.enter_async_context(self._stripes[s])
-            stripe_ms = (time.monotonic() - t_stripe0) * 1000.0
-            return await self._apply_batch_with_retry(
-                txns,
-                pre_commit_hook,
-                tuple(sorted_stripes),
-                _schema_ms=schema_ms,
-                _stripe_ms=stripe_ms,
-            )
-        raise ApplyError(f"unreachable: AsyncExitStack escaped for batch of {len(txns)}")
+            return await self._apply_with_retry(records, pre_commit_hook, sorted_stripes)
+        raise ApplyError("unreachable: AsyncExitStack escaped apply_batch")
 
     async def _apply_with_retry(
         self,
-        txn: CompletedTransaction,
+        records: list[ReadyRecord],
         pre_commit_hook: CursorHook | None,
         stripes: tuple[int, ...],
     ) -> ApplyResult:
-        """Retry loop around `_apply_once`, scoped to a pool-borrowed connection."""
-        last_exc: BaseException | None = None
-        for attempt in range(1, self._max_retries + 1):
+        """Infinite retry loop around `_apply_once`.
+
+        Transient DSQL failures retry forever with exponential backoff. Only
+        `ApplyError` from `_apply_once` (schema missing / malformed record)
+        escapes to the caller — those are not fixable by retrying."""
+        attempt = 0
+        while True:
+            attempt += 1
             conn = await self._borrow_fresh_conn()
             t0 = time.monotonic()
             try:
-                rows_applied, rows_deduped, rows_late_discarded = await self._apply_once(
-                    conn, txn, pre_commit_hook
-                )
+                rows_applied, rows_discarded = await self._apply_once(conn, records, pre_commit_hook)
                 return ApplyResult(
-                    tx_id=txn.tx_id,
                     rows_applied=rows_applied,
-                    rows_deduped=rows_deduped,
-                    rows_late_discarded=rows_late_discarded,
+                    rows_discarded=rows_discarded,
                     attempt=attempt,
                     duration_ms=(time.monotonic() - t0) * 1000.0,
                     stripes=stripes,
                 )
             except _RETRYABLE as exc:
-                last_exc = exc
                 await self._rollback_quiet(conn)
-                log.warning("apply.retryable", tx_id=txn.tx_id, attempt=attempt, error=str(exc))
+                log.warning("apply.retryable", size=len(records), attempt=attempt, error=str(exc))
                 conn = await self._replace_conn(conn)
-                if attempt < self._max_retries:
-                    await asyncio.sleep(self._backoff(attempt))
-            except SchemaNotFoundError as exc:
+                await asyncio.sleep(self._backoff(attempt))
+            except ApplyError:
                 await self._rollback_quiet(conn)
-                raise ApplyError(f"schema missing on target: {exc}") from exc
+                raise
             except Exception as exc:
+                # Unexpected but we still don't fence — log loudly and retry.
                 await self._rollback_quiet(conn)
-                log.error("apply.permanent", tx_id=txn.tx_id, error=str(exc))
-                raise ApplyError(f"non-retryable apply failure: {exc}") from exc
+                log.error(
+                    "apply.unexpected_retrying",
+                    size=len(records),
+                    attempt=attempt,
+                    error=str(exc),
+                    error_class=type(exc).__name__,
+                )
+                await asyncio.sleep(self._backoff(attempt))
             finally:
-                # Return the (possibly replaced) connection to the pool.
                 await self._conn_pool.put(conn)
-        raise ApplyError(f"exhausted {self._max_retries} retries for tx_id={txn.tx_id}: {last_exc}")
 
     async def _apply_once(
         self,
         conn: psycopg.AsyncConnection[tuple[object, ...]],
-        txn: CompletedTransaction,
-        pre_commit_hook: CursorHook | None = None,
-    ) -> tuple[int, int, int]:
+        records: list[ReadyRecord],
+        pre_commit_hook: CursorHook | None,
+    ) -> tuple[int, int]:
         """One attempt against a pool-borrowed connection.
 
-        Returns `(rows_applied, rows_deduped, rows_late_discarded)`."""
+        Returns `(rows_applied, rows_discarded)`."""
         assert self._schema is not None
         rows_applied = 0
-        rows_deduped = 0
-        rows_late_discarded = 0
+        rows_discarded = 0
         async with conn.transaction(), conn.cursor() as cur:
-            for rec in txn.records:
+            for rec in records:
                 schema_name, table_name, pk_text, ts_ns = await self._record_key_tuple(rec)
-                stamped, stored_ts = await self._stamp(cur, schema_name, table_name, pk_text, ts_ns)
+                stamped = await self._lww_stamp(cur, schema_name, table_name, pk_text, ts_ns)
                 if not stamped:
-                    if stored_ts is not None and stored_ts > ts_ns:
-                        rows_late_discarded += 1
-                        await self._handle_late_discard(
-                            cur,
-                            txn.tx_id,
-                            rec,
-                            schema_name,
-                            table_name,
-                            pk_text,
-                            ts_ns,
-                            stored_ts,
-                        )
-                    else:
-                        rows_deduped += 1
+                    rows_discarded += 1
                     continue
                 await self._apply_record(cur, rec)
                 rows_applied += 1
-                if self._fault_after_rows is not None and rows_applied >= self._fault_after_rows:
-                    raise InjectedFaultError(f"injected fault after {rows_applied} row(s), before COMMIT")
             if pre_commit_hook is not None:
                 await pre_commit_hook(cur)
-        return rows_applied, rows_deduped, rows_late_discarded
+        return rows_applied, rows_discarded
 
-    async def _apply_batch_with_retry(
-        self,
-        txns: list[CompletedTransaction],
-        pre_commit_hook: CursorHook | None,
-        stripes: tuple[int, ...],
-        *,
-        _schema_ms: float = 0.0,
-        _stripe_ms: float = 0.0,
-    ) -> list[ApplyResult]:
-        """Retry loop around `_apply_batch_once`, scoped to a pool-borrowed connection."""
-        last_exc: BaseException | None = None
-        for attempt in range(1, self._max_retries + 1):
-            t_pool0 = time.monotonic()
-            conn = await self._borrow_fresh_conn()
-            pool_ms = (time.monotonic() - t_pool0) * 1000.0
-            t0 = time.monotonic()
-            try:
-                per_txn = await self._apply_batch_once(conn, txns, pre_commit_hook)
-                duration_ms = (time.monotonic() - t0) * 1000.0
-                # Sampled per-stage breakdown so operators can see WHERE time
-                # goes without flooding the log at every batch.
-                if attempt == 1 and (hash(txns[0].tx_id) & 0x1F) == 0:
-                    log.info(
-                        "apply_batch.stage_timings",
-                        size=len(txns),
-                        schema_ms=round(_schema_ms, 2),
-                        stripe_ms=round(_stripe_ms, 2),
-                        pool_wait_ms=round(pool_ms, 2),
-                        commit_ms=round(duration_ms, 2),
-                        stripes_count=len(stripes),
-                    )
-                return [
-                    ApplyResult(
-                        tx_id=txn.tx_id,
-                        rows_applied=applied,
-                        rows_deduped=deduped,
-                        rows_late_discarded=late,
-                        attempt=attempt,
-                        duration_ms=duration_ms,
-                        stripes=stripes,
-                    )
-                    for txn, (applied, deduped, late) in zip(txns, per_txn, strict=True)
-                ]
-            except _RETRYABLE as exc:
-                last_exc = exc
-                await self._rollback_quiet(conn)
-                log.warning(
-                    "apply_batch.retryable",
-                    size=len(txns),
-                    attempt=attempt,
-                    error=str(exc),
-                )
-                conn = await self._replace_conn(conn)
-                if attempt < self._max_retries:
-                    await asyncio.sleep(self._backoff(attempt))
-            except SchemaNotFoundError as exc:
-                await self._rollback_quiet(conn)
-                raise ApplyError(f"schema missing on target: {exc}") from exc
-            except Exception as exc:
-                await self._rollback_quiet(conn)
-                log.error("apply_batch.permanent", size=len(txns), error=str(exc))
-                raise ApplyError(f"non-retryable batch failure: {exc}") from exc
-            finally:
-                await self._conn_pool.put(conn)
-        raise ApplyError(f"exhausted {self._max_retries} retries for batch of {len(txns)}: {last_exc}")
+    # ---- LWW stamp ------------------------------------------------------
 
-    async def _apply_batch_once(
-        self,
-        conn: psycopg.AsyncConnection[tuple[object, ...]],
-        txns: list[CompletedTransaction],
-        pre_commit_hook: CursorHook | None,
-    ) -> list[tuple[int, int, int]]:
-        """One attempt against a pool-borrowed connection — one BEGIN..COMMIT for all txns.
-
-        Returns per-txn `(rows_applied, rows_deduped, rows_late_discarded)` tuples."""
-        assert self._schema is not None
-        per_txn: list[tuple[int, int, int]] = []
-        async with conn.transaction(), conn.cursor() as cur:
-            for txn in txns:
-                rows_applied = 0
-                rows_deduped = 0
-                rows_late_discarded = 0
-                for rec in txn.records:
-                    schema_name, table_name, pk_text, ts_ns = await self._record_key_tuple(rec)
-                    stamped, stored_ts = await self._stamp(cur, schema_name, table_name, pk_text, ts_ns)
-                    if not stamped:
-                        if stored_ts is not None and stored_ts > ts_ns:
-                            rows_late_discarded += 1
-                            await self._handle_late_discard(
-                                cur,
-                                txn.tx_id,
-                                rec,
-                                schema_name,
-                                table_name,
-                                pk_text,
-                                ts_ns,
-                                stored_ts,
-                            )
-                        else:
-                            rows_deduped += 1
-                        continue
-                    await self._apply_record(cur, rec)
-                    rows_applied += 1
-                    if self._fault_after_rows is not None and rows_applied >= self._fault_after_rows:
-                        raise InjectedFaultError(f"injected fault after {rows_applied} row(s), before COMMIT")
-                per_txn.append((rows_applied, rows_deduped, rows_late_discarded))
-            if pre_commit_hook is not None:
-                await pre_commit_hook(cur)
-        return per_txn
-
-    # ---- key hashing & stripe computation -------------------------------
-
-    async def _compute_touched_stripes(self, txn: CompletedTransaction) -> set[int]:
-        """Collect the set of stripe ids touched by this txn. Loads schema if needed."""
-        assert self._schema is not None
-        stripes: set[int] = set()
-        for rec in txn.records:
-            source = _source_of(rec)
-            meta = await self._schema.get(source.schema_name, source.table)
-            payload = _after_of(rec) or _before_of(rec)
-            if not payload:
-                continue
-            pk_values = tuple(str(payload.get(pk, "")) for pk in meta.pk_columns)
-            key = (source.schema_name, source.table, pk_values)
-            stripes.add(_stripe_of(key, self._stripe_count))
-        return stripes
-
-    async def _stamp(
+    async def _lww_stamp(
         self,
         cur: psycopg.AsyncCursor[Any],
         schema_name: str,
         table_name: str,
         pk_text: str,
         ts_ns: int,
-    ) -> tuple[bool, int | None]:
-        """Per-key last-writer-wins stamp.
+    ) -> bool:
+        """Advance the LWW stamp for a primary key. Returns True iff advanced.
 
-        Returns `(stamped_ok, stored_ts_ns_or_None)`:
-        - `(True, None)` — the stamp was advanced; the caller should run the
-          row DML. The target transaction will commit both atomically.
-        - `(False, stored)` — the WHERE gate rejected the UPSERT. `stored` is
-          the `applied_ts_ns` already recorded for this key. The caller can
-          compare `stored` to `ts_ns` to tell "late-arriving older txn"
-          (`stored > ts_ns`) from "crash-replay dedup" (`stored == ts_ns`).
-
-        Both branches stay inside the single target `BEGIN...COMMIT` the
-        batch runs under; no extra transaction boundary is introduced.
-        """
+        A False return means an equal-or-newer ts_ns was already recorded —
+        the caller must skip the row DML (either a late-arriving older commit
+        or a crash-replay duplicate)."""
         await cur.execute(
             """
-            INSERT INTO __replicator_applied_v2
+            INSERT INTO __replicator_lww_stamps
                 (schema_name, table_name, pk, applied_ts_ns)
             VALUES (%s, %s, %s, %s)
             ON CONFLICT (schema_name, table_name, pk) DO UPDATE
                 SET applied_ts_ns = EXCLUDED.applied_ts_ns,
                     applied_at    = now()
-                WHERE __replicator_applied_v2.applied_ts_ns < EXCLUDED.applied_ts_ns
+                WHERE __replicator_lww_stamps.applied_ts_ns < EXCLUDED.applied_ts_ns
             """,
             (schema_name, table_name, pk_text, ts_ns),
         )
-        if cur.rowcount == 1:
-            return True, None
-        # Gated or no-op. Fetch the stored ts_ns so the caller can distinguish
-        # late-discard from crash-replay. One extra round-trip, only on the
-        # (uncommon) non-advance path.
-        await cur.execute(
-            "SELECT applied_ts_ns FROM __replicator_applied_v2 "
-            "WHERE schema_name = %s AND table_name = %s AND pk = %s",
-            (schema_name, table_name, pk_text),
-        )
-        row = await cur.fetchone()
-        stored = int(row[0]) if row else 0
-        return False, stored
-
-    async def _handle_late_discard(
-        self,
-        cur: psycopg.AsyncCursor[Any],
-        tx_id: str,
-        rec: ReadyRecord,
-        schema_name: str,
-        table_name: str,
-        pk_text: str,
-        incoming_ts_ns: int,
-        stored_ts_ns: int,
-    ) -> None:
-        """Log + persist a late-arriving record that the LWW guard rejected.
-
-        Runs in the batch's open target transaction so the audit row is atomic
-        with the stamp decision. One structured `apply.late_discard` log line
-        per row and one row written to `__replicator_late_discards`.
-        """
-        import json as _json
-
-        op = _op_of(rec)
-        payload = {"before": _before_of(rec), "after": _after_of(rec)}
-        payload_text = _json.dumps(payload, default=str, separators=(",", ":"))
-        log.info(
-            "apply.late_discard",
-            tx_id=tx_id,
-            record_id=_record_id(rec),
-            schema=schema_name,
-            table=table_name,
-            pk=pk_text,
-            incoming_ts_ns=incoming_ts_ns,
-            stored_ts_ns=stored_ts_ns,
-            delta_ms=round((stored_ts_ns - incoming_ts_ns) / 1_000_000.0, 1),
-            op=op,
-        )
-        await self._record_late_discard(
-            cur,
-            tx_id=tx_id,
-            record_id=_record_id(rec),
-            schema_name=schema_name,
-            table_name=table_name,
-            pk_text=pk_text,
-            incoming_ts_ns=incoming_ts_ns,
-            stored_ts_ns=stored_ts_ns,
-            op=op,
-            payload_text=payload_text,
-        )
-
-    async def _record_late_discard(
-        self,
-        cur: psycopg.AsyncCursor[Any],
-        *,
-        tx_id: str,
-        record_id: str,
-        schema_name: str,
-        table_name: str,
-        pk_text: str,
-        incoming_ts_ns: int,
-        stored_ts_ns: int,
-        op: str,
-        payload_text: str,
-    ) -> None:
-        """Persist the full losing record to `__replicator_late_discards`.
-
-        Writes inside the batch's open target transaction, so persistence is
-        atomic with the LWW decision. ON CONFLICT DO NOTHING makes the write
-        idempotent on retries (we only record the first observed loss).
-        """
-        await cur.execute(
-            """
-            INSERT INTO __replicator_late_discards
-                (tx_id, record_id, schema_name, table_name, pk,
-                 incoming_ts_ns, stored_ts_ns, op, payload)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (tx_id, record_id) DO NOTHING
-            """,
-            (
-                tx_id,
-                record_id,
-                schema_name,
-                table_name,
-                pk_text,
-                incoming_ts_ns,
-                stored_ts_ns,
-                op,
-                payload_text,
-            ),
-        )
+        return cur.rowcount == 1
 
     async def _record_key_tuple(self, rec: ReadyRecord) -> tuple[str, str, str, int]:
-        """Return the LWW stamp key for a record: (schema, table, pk_json, ts_ns)."""
         assert self._schema is not None
         source = _source_of(rec)
         meta = await self._schema.get(source.schema_name, source.table)
         payload = _after_of(rec) or _before_of(rec) or {}
         pk_values = [str(payload.get(pk, "")) for pk in meta.pk_columns]
-        import json
-
         pk_text = json.dumps(pk_values, separators=(",", ":"))
         return source.schema_name, source.table, pk_text, int(source.ts_ns)
+
+    async def _touched_stripes(self, rec: ReadyRecord) -> set[int]:
+        assert self._schema is not None
+        source = _source_of(rec)
+        meta = await self._schema.get(source.schema_name, source.table)
+        payload = _after_of(rec) or _before_of(rec) or {}
+        pk_values = tuple(str(payload.get(pk, "")) for pk in meta.pk_columns)
+        key = (source.schema_name, source.table, pk_values)
+        return {_stripe_of(key, self._stripe_count)}
+
+    # ---- row DML --------------------------------------------------------
 
     async def _apply_record(self, cur: psycopg.AsyncCursor[Any], rec: ReadyRecord) -> None:
         assert self._schema is not None
@@ -841,36 +469,22 @@ class Applier:
     async def _replace_conn(
         self, old: psycopg.AsyncConnection[tuple[object, ...]]
     ) -> psycopg.AsyncConnection[tuple[object, ...]]:
-        """Close a broken connection + open a fresh one with refreshed token.
-
-        Does its own bounded retry loop (3 attempts, exp backoff) before giving up.
-        On total failure returns the (now-closed) old conn — the outer retry loop
-        will treat it as `_RETRYABLE` and come back here on the next attempt.
-        The old `return old` path with a LIVE broken socket caused the 2026-10-26
-        SSL-EOF fence storm: all 5 outer retries looped on the same dead socket.
-        """
         self._conn_opened_mono.pop(id(old), None)
         if not old.closed:
             try:
                 await old.close()
             except Exception as exc:
                 log.debug("apply.close.quiet", error=str(exc))
-        for inner in range(1, 4):  # 3 attempts, bounded so caller's budget still shrinks
+        for inner in range(1, 4):
             try:
                 await self._token_cache.get_async(force_refresh=True)
                 new_conn = await open_connection(self._endpoint, self._token_cache, autocommit=False)
                 self._conn_opened_mono[id(new_conn)] = time.monotonic()
                 return new_conn
             except Exception as exc:
-                log.warning(
-                    "apply.reconnect.failed",
-                    attempt=inner,
-                    error=str(exc),
-                )
+                log.warning("apply.reconnect.failed", attempt=inner, error=str(exc))
                 if inner < 3:
                     await asyncio.sleep(self._backoff(inner))
-        # All inner attempts failed. Return the closed `old` — the outer except
-        # block's next iteration will catch IOError on it and come back here.
         return old
 
     def _backoff(self, attempt: int) -> float:
@@ -878,8 +492,6 @@ class Applier:
         return random.uniform(0.0, upper)
 
     async def _refresh_schema_conn(self) -> None:
-        """Close + reopen the schema connection; swap it into SchemaCache. Called when
-        the schema conn's DSQL token has expired and the server has closed the socket."""
         assert self._schema is not None
         old = self._schema_conn
         self._schema_conn = None
@@ -895,12 +507,6 @@ class Applier:
 
 
 # ---------- small helpers over ReadyRecord ----------
-
-
-def _record_id(rec: ReadyRecord) -> str:
-    if isinstance(rec, AssembledRecord):
-        return rec.main.transaction.record_id
-    return rec.transaction.record_id
 
 
 def _source_of(rec: ReadyRecord) -> Any:
@@ -930,10 +536,6 @@ def _before_of(rec: ReadyRecord) -> dict[str, Any] | None:
 
 
 def _stripe_of(key: tuple[str, str, tuple[str, ...]], stripe_count: int) -> int:
-    """Stable hash of a (schema, table, pk-tuple) to a stripe id in [0, stripe_count).
-
-    Uses blake2b with a 2-byte digest — plenty for 64 stripes with low collision rate.
-    """
     h = hashlib.blake2b(digest_size=2)
     h.update(key[0].encode("utf-8"))
     h.update(b"\0")
@@ -945,5 +547,6 @@ def _stripe_of(key: tuple[str, str, tuple[str, ...]], stripe_count: int) -> int:
     return int.from_bytes(h.digest(), "big") % stripe_count
 
 
-# Silence unused imports kept for forward reference.
+# Keep forward-reference imports live so callers that re-export them do not
+# break on the applier module boundary.
 _ = (FullRecord, ChunkedRecord)
