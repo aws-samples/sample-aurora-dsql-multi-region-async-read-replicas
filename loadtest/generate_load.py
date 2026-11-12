@@ -101,15 +101,18 @@ def gen_payload() -> str:
 
 
 def gen_dmls(
-    recent_ids_per_table: dict[str, Deque[uuid.UUID]], tables: list[str]
+    recent_ids_per_table: dict[str, Deque[uuid.UUID]],
+    tables: list[str],
+    min_dmls: int = 2,
+    max_dmls: int = 5,
 ) -> list[tuple[str, tuple]]:
-    """Build 2-5 DMLs for a single transaction, spread across the given tables.
+    """Build `min_dmls`-`max_dmls` DMLs for a single transaction, spread across tables.
 
     Each DML picks a table at random (uniform). This produces mixed-table
     transactions when `tables` has >1 entry, which exercises cross-table CDC
     reassembly on the replicator side. Each table has its own recent-ids deque
     so UPDATE/DELETE targets a row from the same table as the SQL."""
-    n = random.randint(2, 5)
+    n = random.randint(min_dmls, max_dmls)
     stmts: list[tuple[str, tuple]] = []
     for _ in range(n):
         table = random.choice(tables)
@@ -154,6 +157,8 @@ async def worker(
     started_at: float,
     tables: list[str],
     start_delay_sec: float = 0.0,
+    min_dmls: int = 2,
+    max_dmls: int = 5,
 ) -> None:
     if start_delay_sec > 0:
         await asyncio.sleep(start_delay_sec)
@@ -180,7 +185,7 @@ async def worker(
                 await asyncio.sleep(1.0)
                 continue
 
-        stmts = gen_dmls(recent_ids_per_table, tables)
+        stmts = gen_dmls(recent_ids_per_table, tables, min_dmls, max_dmls)
         t0 = time.monotonic()
         try:
             async with conn.transaction():
@@ -281,6 +286,8 @@ async def main_async(args: argparse.Namespace) -> None:
                 i, args.cluster_host, token_cache, rate_per_worker, stop_at, stats_list[i],
                 minutes, minutes_lock, started_at, tables,
                 start_delay_sec=(ramp_sec * i / max(1, args.workers - 1)) if ramp_sec > 0 else 0.0,
+                min_dmls=args.min_dmls,
+                max_dmls=args.max_dmls,
             )
         )
         for i in range(args.workers)
@@ -367,6 +374,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ramp-sec", type=float, default=0.0, help="stagger worker starts linearly over this window")
     p.add_argument("--table", default="load_test", help="single-table DML target (must exist on source + target)")
     p.add_argument("--tables", default=None, help="comma-separated table list; wins over --table. Each txn's DMLs spread across these.")
+    p.add_argument("--min-dmls", type=int, default=2, help="minimum DML statements per transaction")
+    p.add_argument("--max-dmls", type=int, default=5, help="maximum DML statements per transaction")
     p.add_argument("--output", default=None)
     return p.parse_args()
 
