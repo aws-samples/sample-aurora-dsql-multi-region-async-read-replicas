@@ -19,6 +19,12 @@ RUN apt-get update \
     && useradd --system --uid 10001 replicator
 COPY --from=builder /wheels /wheels
 RUN pip install --no-cache-dir /wheels/*.whl && rm -rf /wheels
+
+# Private DSQL service model override (adds CDC stream APIs missing from
+# public boto3). Optional: build context may or may not ship aws-models/.
+COPY aws-models /opt/aws-models
+ENV AWS_DATA_PATH=/opt/aws-models
+
 USER replicator
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 LOG_LEVEL=INFO
 

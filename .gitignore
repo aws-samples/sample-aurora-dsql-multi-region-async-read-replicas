@@ -43,3 +43,5 @@ REVIEW_FIXES_SUMMARY.md
 REVIEW_FIXES_SUMMARY.pdf
 review_response.md
 review_response.pdf
+replicator/aws-models/*
+!replicator/aws-models/.gitkeep

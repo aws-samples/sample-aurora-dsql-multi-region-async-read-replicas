@@ -56,7 +56,17 @@ def discover_source_streams(
         kwargs: dict = {"clusterIdentifier": cluster_id}
         if next_token:
             kwargs["nextToken"] = next_token
-        resp = client.list_streams(**kwargs)
+        try:
+            resp = client.list_streams(**kwargs)
+        except AttributeError as exc:
+            raise ConfigError(
+                "DSQL CDC APIs (ListStreams/GetStream) are not available in this "
+                "boto3 install — public boto3 does not yet ship the CDC operations. "
+                "Either (a) pass SOURCE_STREAMS directly and unset SOURCE_CLUSTER_ID "
+                "to skip preflight, or (b) drop the preview DSQL service model into "
+                "replicator/aws-models/dsql/2018-05-10/service-2.json so the "
+                "container's AWS_DATA_PATH override picks it up."
+            ) from exc
         streams.extend(resp.get("streams", []))
         next_token = resp.get("nextToken")
         if not next_token:
