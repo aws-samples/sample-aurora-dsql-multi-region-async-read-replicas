@@ -78,7 +78,7 @@ aws dsql create-stream \
   --cluster-identifier <source-cluster-id> \
   --region <source-region> \
   --target-definition kinesis='{streamArn=arn:aws:kinesis:<source-region>:<account>:stream/dsql-cdc-stream,roleArn=arn:aws:iam::<account>:role/dsql-cdc-writer}' \
-  --ordering ORDERED_PER_SOURCE \
+  --ordering UNORDERED \
   --format JSON
 ```
 
@@ -124,11 +124,35 @@ Expect a JSON report confirming the state tables and dashboard.
 Both modes deploy the same Fargate service; they differ only in how the
 operator names the **source**.
 
-### Mode A — You know the source cluster id (production path)
+### Mode B — You know the Kinesis stream directly (default path)
+
+This is the mode that works out of the box with stock public boto3. Pass
+the stream name attached to your source cluster.
+
+```bash
+cd ../infra/
+AWS_REGION=<control-region> .venv/bin/cdk deploy \
+  -c source_stream_name=<KINESIS_STREAM_NAME> \
+  -c source_region=<source-region> \
+  -c target_cluster_id=<TARGET_CLUSTER_ID> \
+  -c target_region=<target-region>
+```
+
+`source_stream_name` defaults to `dsql-cdc-stream`, so the minimal command
+collapses to just the target context.
+
+### Mode A — You know only the source cluster id (auto-derive stream)
 
 Preflight calls `dsql:ListStreams` + `dsql:GetStream` on the source cluster
 at startup, picks the ACTIVE stream, and reads the Kinesis ARN out of its
-CDC configuration. You never type a stream name.
+CDC configuration — you never type a stream name.
+
+**Prerequisite:** public boto3 does not yet ship the DSQL CDC APIs
+(ListStreams/GetStream). Until those land, drop the preview DSQL service
+model into `replicator/aws-models/dsql/2018-05-10/service-2.json` before
+`cdk deploy`. The Dockerfile's `AWS_DATA_PATH=/opt/aws-models` picks it
+up. Without the model, Mode A fails fast with a readable preflight error
+pointing you back to Mode B.
 
 ```bash
 cd ../infra/
@@ -141,23 +165,6 @@ AWS_REGION=<control-region> .venv/bin/cdk deploy \
 
 If no ACTIVE stream is attached, the task fails fast with a clear
 `CDC is not enabled` error instead of silently consuming nothing.
-
-### Mode B — You know the Kinesis stream directly (demo / shared-stream path)
-
-Use this when CDC was wired up outside this project and you already have
-the stream name — e.g. a shared ingest stream, or a demo scenario where
-`loadtest/synthetic_publisher.py` writes directly to Kinesis.
-
-```bash
-AWS_REGION=<control-region> .venv/bin/cdk deploy \
-  -c source_stream_name=<KINESIS_STREAM_NAME> \
-  -c source_region=<source-region> \
-  -c target_cluster_id=<TARGET_CLUSTER_ID> \
-  -c target_region=<target-region>
-```
-
-`source_stream_name` defaults to `dsql-cdc-stream`, so the minimal command
-collapses to just the target context.
 
 Watch the Fargate task come up:
 
