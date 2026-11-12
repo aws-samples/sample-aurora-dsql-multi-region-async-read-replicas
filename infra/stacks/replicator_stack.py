@@ -221,49 +221,54 @@ class DsqlReplicatorStack(cdk.Stack):
         exec_role = task_def.obtain_execution_role()
         image_asset.repository.grant_pull(exec_role)
 
+        # When SOURCE_CLUSTER_ID is set, preflight auto-derives SOURCE_STREAMS
+        # from the cluster's CDC config. Passing SOURCE_STREAMS in env then
+        # would trip preflight's disagreement check if the operator-supplied
+        # context default (`dsql-cdc-stream`) differs from the real stream
+        # name attached to the cluster. Mode A: omit SOURCE_STREAMS entirely;
+        # Mode B: pass SOURCE_STREAMS, omit SOURCE_CLUSTER_ID.
+        container_env: dict[str, str] = {
+            "SOURCE_CLUSTER_ID": source_cluster_id or "",
+            "SOURCE_REGION": source_region,
+            "TARGET_CLUSTER_ID": target_cluster_id,
+            "TARGET_REGION": target_region,
+            "RESOURCE_PREFIX": resource_prefix,
+            "CONTROL_REGION": source_region,
+            "LOG_LEVEL": "INFO",
+            # M7.0c: 2 child processes, each 128 workers / 512 stripes. Total
+            # concurrent apply lanes to target = 256 (same as prior single-proc).
+            "REPLICATOR_PROCESSES": "2",
+            "APPLIER_WORKERS": "128",
+            # Autoscale ceiling. Writer pool grows 128 → 256 when
+            # end-to-end lag exceeds 10s for 60s; shrinks back on 2s/5min.
+            # Set equal to APPLIER_WORKERS to disable scaling.
+            "APPLIER_WORKERS_MAX": "256",
+            # STRIPES must dwarf APPLIER_WORKERS_MAX * stripes-per-batch
+            # (the ceiling, not the floor), else once the autoscaler grows
+            # the pool past 128 workers they queue on asyncio stripe locks
+            # and CPU stays ~2%. 16384 = 64 × 256-worker ceiling. See the
+            # 2026-10-26 stripe-contention finding in docs/DESIGN.md.
+            "APPLIER_STRIPES": "16384",
+            # Micro-batching (A): 2 source txns per cross-region commit, flush
+            # partial batches after 50 ms. Larger values (16) measured 2026-10-26
+            # produced ~50 stripes/batch which near-fully serialized on stripe
+            # locks and collapsed applier throughput to ~11 TPS. BATCH=2 keeps
+            # stripes/batch at ~7, which plays well with APPLIER_STRIPES=8192.
+            "BATCH_MAX_TXNS": "2",
+            "BATCH_MAX_WAIT_MS": "50",
+            # Re-list Kinesis shards every 5 min so a mid-run reshard
+            # (e.g. 10 → 12 shards) is picked up without rolling the task.
+            # Set to "0" to disable periodic re-discovery.
+            "SHARD_DISCOVERY_INTERVAL_MS": "300000",
+        }
+        if not source_cluster_id:
+            container_env["SOURCE_STREAMS"] = source_stream_name
+
         container = task_def.add_container(
             "Replicator",
             image=ecs.ContainerImage.from_docker_image_asset(image_asset),
             logging=ecs.LogDrivers.aws_logs(stream_prefix="replicator", log_group=log_group),
-            environment={
-                # When SOURCE_CLUSTER_ID is set, the replicator auto-derives
-                # SOURCE_STREAMS from the cluster's CDC config at startup and
-                # ignores the SOURCE_STREAMS passed here (preflight verifies
-                # the two agree if the operator sets both).
-                "SOURCE_STREAMS": source_stream_name,
-                "SOURCE_CLUSTER_ID": source_cluster_id or "",
-                "SOURCE_REGION": source_region,
-                "TARGET_CLUSTER_ID": target_cluster_id,
-                "TARGET_REGION": target_region,
-                "RESOURCE_PREFIX": resource_prefix,
-                "CONTROL_REGION": source_region,
-                "LOG_LEVEL": "INFO",
-                # M7.0c: 2 child processes, each 128 workers / 512 stripes. Total
-                # concurrent apply lanes to target = 256 (same as prior single-proc).
-                "REPLICATOR_PROCESSES": "2",
-                "APPLIER_WORKERS": "128",
-                # Autoscale ceiling. Writer pool grows 128 → 256 when
-                # end-to-end lag exceeds 10s for 60s; shrinks back on 2s/5min.
-                # Set equal to APPLIER_WORKERS to disable scaling.
-                "APPLIER_WORKERS_MAX": "256",
-                # STRIPES must dwarf APPLIER_WORKERS_MAX * stripes-per-batch
-                # (the ceiling, not the floor), else once the autoscaler grows
-                # the pool past 128 workers they queue on asyncio stripe locks
-                # and CPU stays ~2%. 16384 = 64 × 256-worker ceiling. See the
-                # 2026-10-26 stripe-contention finding in docs/DESIGN.md.
-                "APPLIER_STRIPES": "16384",
-                # Micro-batching (A): 2 source txns per cross-region commit, flush
-                # partial batches after 50 ms. Larger values (16) measured 2026-10-26
-                # produced ~50 stripes/batch which near-fully serialized on stripe
-                # locks and collapsed applier throughput to ~11 TPS. BATCH=2 keeps
-                # stripes/batch at ~7, which plays well with APPLIER_STRIPES=8192.
-                "BATCH_MAX_TXNS": "2",
-                "BATCH_MAX_WAIT_MS": "50",
-                # Re-list Kinesis shards every 5 min so a mid-run reshard
-                # (e.g. 10 → 12 shards) is picked up without rolling the task.
-                # Set to "0" to disable periodic re-discovery.
-                "SHARD_DISCOVERY_INTERVAL_MS": "300000",
-            },
+            environment=container_env,
             health_check=ecs.HealthCheck(
                 command=["CMD-SHELL", "dsql-replicator healthz || exit 1"],
                 interval=cdk.Duration.seconds(30),

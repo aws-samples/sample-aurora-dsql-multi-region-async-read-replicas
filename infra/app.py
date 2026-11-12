@@ -13,8 +13,11 @@ Required context:
 Optional context (defaults in parens):
     account                 — AWS account for the control-plane region
                               (CDK_DEFAULT_ACCOUNT)
-    region                  — control-plane region where the Fargate task runs
-                              (CDK_DEFAULT_REGION or us-east-1)
+    region                  — control-plane region where the Fargate task runs.
+                              Defaults to target_region so the applier commits
+                              are in-region to the target DSQL cluster (per-txn
+                              cross-region RTT is the applier throughput floor).
+                              Explicit override still works.
     source_cluster_id       — DSQL cluster id for the replication SOURCE. When
                               set, the replicator verifies CDC is enabled on
                               that cluster at startup and auto-derives the
@@ -41,11 +44,6 @@ from stacks.replicator_stack import DsqlReplicatorStack
 app = cdk.App()
 
 account = app.node.try_get_context("account") or os.environ.get("CDK_DEFAULT_ACCOUNT")
-region = (
-    app.node.try_get_context("region")
-    or os.environ.get("CDK_DEFAULT_REGION")
-    or "us-east-1"
-)
 
 target_cluster_id = app.node.try_get_context("target_cluster_id")
 if not target_cluster_id:
@@ -53,6 +51,15 @@ if not target_cluster_id:
         "Missing required CDK context 'target_cluster_id'. "
         "Pass it with: cdk deploy -c target_cluster_id=<your-target-cluster-id>"
     )
+
+target_region = app.node.try_get_context("target_region") or "us-west-2"
+
+# Fargate runs in the target region. Co-location keeps apply commits in-region,
+# which is the dominant factor in replicator throughput — the per-txn apply RTT
+# is the applier's throughput floor. Explicit -c region=... still wins for
+# advanced topologies; CDK_DEFAULT_REGION is intentionally NOT consulted so a
+# stray env var can't silently split the control plane from the data plane.
+region = app.node.try_get_context("region") or target_region
 
 DsqlReplicatorStack(
     app,
@@ -62,7 +69,7 @@ DsqlReplicatorStack(
     source_stream_name=app.node.try_get_context("source_stream_name") or "dsql-cdc-stream",
     source_region=app.node.try_get_context("source_region") or "us-east-1",
     target_cluster_id=target_cluster_id,
-    target_region=app.node.try_get_context("target_region") or "us-west-2",
+    target_region=target_region,
     resource_prefix=app.node.try_get_context("resource_prefix") or "dsql-replicator",
     alarm_email=app.node.try_get_context("alarm_email") or None,
 )
